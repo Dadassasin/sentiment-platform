@@ -1,0 +1,2 @@
+"""Desktop sentiment analysis laboratory."""
+
