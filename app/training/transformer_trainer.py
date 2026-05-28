@@ -45,6 +45,7 @@ class TrainConfig:
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
     validation_split: float = 0.2
+    test_split: float = 0.1
     stratify_split: bool = True
     split_seed: int = 42
     seed: int = 42
@@ -97,6 +98,11 @@ class TrainResult:
     train_size: int
     validation_size: int
     label_to_id: dict[str, int]
+    validation_source: str = "split"
+    test_size: int = 0
+    test_accuracy: float = 0.0
+    test_macro_f1: float = 0.0
+    test_source: str = "none"
 
 
 class TrainingError(RuntimeError):
@@ -122,35 +128,108 @@ def train_transformer_classifier(
     labels: list[object],
     config: TrainConfig,
     progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    val_texts: list[str] | None = None,
+    val_labels: list[object] | None = None,
+    test_texts: list[str] | None = None,
+    test_labels: list[object] | None = None,
 ) -> TrainResult:
-    """Fine-tune a sequence-classification transformer and save it locally."""
+    """Fine-tune a sequence-classification transformer and save it locally.
+
+    Если val_texts/val_labels переданы — они используются как validation вместо
+    отрезания процента от train. Если переданы test_texts/test_labels — после
+    обучения выполняется held-out оценка и метрики сохраняются вместе с моделью.
+    """
 
     if torch is None or AutoTokenizer is None or AutoModelForSequenceClassification is None:
         raise TrainingError("Не установлены зависимости torch/transformers. Выполните: pip install -r requirements.txt")
 
+    def cancelled() -> bool:
+        return should_stop is not None and should_stop()
+
     set_seed(config.seed)
+    if cancelled():
+        raise TrainingError("Обучение прервано пользователем.")
     clean_rows = prepare_rows(texts, labels, config)
     if len(clean_rows) < 6:
         raise TrainingError("Для обучения нужно минимум 6 непустых размеченных текстов.")
 
-    clean_texts = [row[0] for row in clean_rows]
-    normalized_labels = normalize_labels([row[1] for row in clean_rows])
-    label_to_id = build_label_mapping(normalized_labels)
-    y = [label_to_id[label] for label in normalized_labels]
+    has_external_val = val_texts is not None and val_labels is not None and len(val_texts) > 0
+    has_external_test = test_texts is not None and test_labels is not None and len(test_texts) > 0
+
+    clean_train_texts = [row[0] for row in clean_rows]
+    normalized_train_labels = normalize_labels([row[1] for row in clean_rows])
+
+    all_normalized_labels = list(normalized_train_labels)
+    normalized_val_labels: list[str] = []
+    if has_external_val:
+        normalized_val_labels = normalize_labels(list(val_labels))
+        all_normalized_labels.extend(normalized_val_labels)
+    normalized_test_labels: list[str] = []
+    if has_external_test:
+        normalized_test_labels = normalize_labels(list(test_labels))
+        all_normalized_labels.extend(normalized_test_labels)
+
+    label_to_id = build_label_mapping(all_normalized_labels)
+    train_y_all = [label_to_id[label] for label in normalized_train_labels]
 
     if len(label_to_id) < 2:
         raise TrainingError("В колонке меток должен быть минимум 2 разных класса.")
 
-    train_texts, val_texts, train_y, val_y = split_dataset(
-        clean_texts,
-        y,
-        config.validation_split,
-        config.split_seed,
-        config.stratify_split,
-    )
+    if has_external_test:
+        test_texts_clean = [str(text).strip() for text in test_texts]
+        test_y = [label_to_id[label] for label in normalized_test_labels]
+        test_source = "external"
+        train_pool_texts = clean_train_texts
+        train_pool_y = train_y_all
+    elif config.test_split > 0:
+        train_pool_texts, test_texts_clean, train_pool_y, test_y = split_dataset(
+            clean_train_texts,
+            train_y_all,
+            config.test_split,
+            config.split_seed,
+            config.stratify_split,
+        )
+        test_source = "split"
+    else:
+        test_texts_clean = []
+        test_y = []
+        test_source = "none"
+        train_pool_texts = clean_train_texts
+        train_pool_y = train_y_all
+
+    if has_external_val:
+        train_texts_split = train_pool_texts
+        train_y = train_pool_y
+        val_texts_split = [str(text).strip() for text in val_texts]
+        val_y = [label_to_id[label] for label in normalized_val_labels]
+        validation_source = "external"
+    else:
+        train_texts_split, val_texts_split, train_y, val_y = split_dataset(
+            train_pool_texts,
+            train_pool_y,
+            config.validation_split,
+            config.split_seed + 1,
+            config.stratify_split,
+        )
+        validation_source = "split"
+
+    # keep variable name compatible with downstream code
+    train_texts = train_texts_split
+    val_texts = val_texts_split
     local_only = config.local_files_only and os.getenv("SENTIMENT_ALLOW_MODEL_DOWNLOAD", "").strip() != "1"
 
+    validation_label = "файл" if validation_source == "external" else "split"
+    test_label = "файл" if test_source == "external" else test_source
+    emit(progress, f"Фактическая выборка: train={len(train_texts)}, validation={len(val_texts)} ({validation_label})")
+    if test_texts_clean:
+        emit(progress, f"Test: {len(test_texts_clean)} строк ({test_label})")
+
+    model_source = "локальный кэш" if local_only else "Hugging Face Hub или локальный кэш"
     emit(progress, f"Загрузка базовой модели: {config.model_name}")
+    emit(progress, f"Источник модели: {model_source}")
+    if cancelled():
+        raise TrainingError("Обучение прервано пользователем.")
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
@@ -166,9 +245,14 @@ def train_transformer_classifier(
             trust_remote_code=config.trust_remote_code,
         )
     except Exception as exc:
+        hint = (
+            "Снимите флажок 'Только локальные файлы' или укажите локальный путь к модели."
+            if local_only
+            else "Проверьте подключение к интернету или укажите локальный путь к уже скачанной модели."
+        )
         raise TrainingError(
             f"Не удалось загрузить базовую модель '{config.model_name}'. "
-            "Укажите локальный путь или разрешите загрузку через SENTIMENT_ALLOW_MODEL_DOWNLOAD=1."
+            f"{hint}"
         ) from exc
 
     id_to_label = {index: label for label, index in label_to_id.items()}
@@ -183,6 +267,8 @@ def train_transformer_classifier(
     model.to(device)
 
     emit(progress, "Токенизация данных")
+    if cancelled():
+        raise TrainingError("Обучение прервано пользователем.")
     train_dataset = make_dataset(tokenizer, train_texts, train_y, config)
     val_dataset = make_dataset(tokenizer, val_texts, val_y, config)
     train_loader = DataLoader(
@@ -212,10 +298,14 @@ def train_transformer_classifier(
     stale_evals = 0
 
     for epoch in range(1, config.epochs + 1):
+        if cancelled():
+            raise TrainingError("Обучение прервано пользователем.")
         model.train()
         total_loss = 0.0
         optimizer.zero_grad()
         for step, batch in enumerate(train_loader, 1):
+            if cancelled():
+                raise TrainingError("Обучение прервано пользователем.")
             batch = {key: value.to(device) for key, value in batch.items()}
             labels_tensor = batch.pop("labels")
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -227,12 +317,17 @@ def train_transformer_classifier(
                 scaler.unscale_(optimizer)
                 if config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                scale_before_step = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                scale_after_step = scaler.get_scale()
+                if not use_amp or scale_after_step >= scale_before_step:
+                    scheduler.step()
                 optimizer.zero_grad()
             total_loss += float(loss.detach().cpu())
 
+        if cancelled():
+            raise TrainingError("Обучение прервано пользователем.")
         accuracy, macro_f1 = evaluate(model, val_loader, device)
         best_accuracy = max(best_accuracy, accuracy)
         best_f1 = max(best_f1, macro_f1)
@@ -252,6 +347,25 @@ def train_transformer_classifier(
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    if cancelled():
+        raise TrainingError("Обучение прервано пользователем.")
+
+    test_accuracy = 0.0
+    test_f1 = 0.0
+    test_dataset = None
+    test_loader = None
+    if test_texts_clean:
+        emit(progress, f"Held-out оценка на test ({len(test_texts_clean)} строк)")
+        test_dataset = make_dataset(tokenizer, test_texts_clean, test_y, config)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.eval_batch_size,
+            num_workers=config.dataloader_num_workers,
+            pin_memory=config.dataloader_pin_memory and device.type == "cuda",
+        )
+        test_accuracy, test_f1 = evaluate(model, test_loader, device)
+        emit(progress, f"Test: accuracy={test_accuracy:.3f}, macro_f1={test_f1:.3f}")
+
     config.output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(config.output_dir)
     model.save_pretrained(config.output_dir)
@@ -261,6 +375,11 @@ def train_transformer_classifier(
         "macro_f1": best_f1,
         "train_size": len(train_texts),
         "validation_size": len(val_texts),
+        "validation_source": validation_source,
+        "test_size": len(test_texts_clean),
+        "test_accuracy": test_accuracy,
+        "test_macro_f1": test_f1,
+        "test_source": test_source,
         "label_to_id": label_to_id,
         "id_to_ru_label": {str(label_to_id[key]): ID_TO_RU_LABEL.get(key, key) for key in label_to_id},
         "experiment_config": serialize_config(config),
@@ -290,6 +409,22 @@ def train_transformer_classifier(
             json.dumps(prediction_rows, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if test_texts_clean and test_loader is not None:
+            test_predictions = predict_label_ids(model, test_loader, device)
+            test_prediction_rows = [
+                {
+                    "text": text,
+                    "true_label_id": target,
+                    "predicted_label_id": prediction,
+                    "true_label": id_to_label.get(target, str(target)),
+                    "predicted_label": id_to_label.get(prediction, str(prediction)),
+                }
+                for text, target, prediction in zip(test_texts_clean, test_y, test_predictions, strict=False)
+            ]
+            (config.output_dir / "test_predictions.json").write_text(
+                json.dumps(test_prediction_rows, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
     emit(progress, f"Модель сохранена: {config.output_dir}")
 
     return TrainResult(
@@ -299,6 +434,11 @@ def train_transformer_classifier(
         train_size=len(train_texts),
         validation_size=len(val_texts),
         label_to_id=label_to_id,
+        validation_source=validation_source,
+        test_size=len(test_texts_clean),
+        test_accuracy=test_accuracy,
+        test_macro_f1=test_f1,
+        test_source=test_source,
     )
 
 

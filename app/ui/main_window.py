@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -21,8 +22,8 @@ from pathlib import Path
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -49,6 +50,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -57,8 +59,10 @@ from app.models.sentiment import (
     AnalysisResult,
     MODEL_PROFILES,
     TRAINING_BASE_MODELS,
+    TOKENIZER_VOCAB_FILES,
     SentimentAnalyzer,
     TransformerLoadError,
+    WEIGHT_FILES,
 )
 from app.monitoring import build_drift_report
 from app.preprocessing import PreprocessingOptions
@@ -66,6 +70,10 @@ from app.reports import export_html_report
 from app.training.experiments import class_distribution, comparison_rows, summarize_results
 from app.training.transformer_trainer import TrainConfig, TrainResult, TrainingError, train_transformer_classifier
 
+def resource_path(relative_path: str) -> str:
+    import sys
+    base_path = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
+    return str(Path(base_path) / relative_path)
 
 POSITIVE = "Положительная"
 NEUTRAL = "Нейтральная"
@@ -95,18 +103,19 @@ TRAINING_FIELD_HELP = {
     "Папка сохранения": "Куда будут записаны модель, tokenizer, метрики, training_config.json и predictions.",
     "Seed": "Фиксирует случайность разбиения и обучения, чтобы запуск можно было повторить.",
     "Описание": "Заметка о гипотезе, датасете или отличиях этого запуска от других.",
-    "Колонка текста": "Столбец датасета, из которого берутся тексты для fine-tuning.",
+    "Колонка текста": "Столбец датасета, из которого берутся тексты для дообучения модели.",
     "Колонка метки": "Столбец с исходными метками; лишние значения настраиваются во вкладке Метки.",
     "Максимум строк": "Ограничивает размер обучающего набора для быстрых пробных запусков; 0 значит без ограничения.",
     "Очистка": "Удаляет дубли и перемешивает строки перед разбиением на train/validation.",
     "Validation split": "Доля данных, отложенная для проверки качества после каждой эпохи.",
+    "Test split": "Доля данных, отложенная для независимой оценки после обучения. Применяется только если отдельная тестовая выборка не загружена. 0 — не использовать тестовую выборку.",
     "Split seed": "Отдельный seed для разбиения данных на train и validation.",
     "Стратегия": "Стратификация сохраняет похожее распределение классов в train и validation.",
     "Веса классов": "Balanced повышает вклад редких классов, если данные несбалансированы.",
-    "Лучшая модель по": "Метрика, по которой выбирается лучший checkpoint и работает early stopping.",
+    "Лучшая модель по": "Метрика, по которой выбирается лучшая сохранённая версия модели и выполняется ранняя остановка.",
     "Базовая модель": "Pretrained checkpoint, от которого начинается дообучение классификатора.",
     "Тип задачи": "Для текущего sentiment-classifier используется single-label classification.",
-    "Загрузка": "Контролирует локальную загрузку, trust_remote_code и замену несовпадающей головы классификации.",
+    "Загрузка": "По умолчанию Hugging Face модели скачиваются в локальный кэш. Включайте локальный режим только для офлайн-запуска.",
     "Заморозка": "Позволяет обучать только голову или заморозить embeddings на маленьком датасете.",
     "Первые N слоёв": "Замораживает первые encoder-слои, снижая расход памяти и риск переобучения.",
     "Max length": "Максимальное число токенов на текст; больше длина значит медленнее и больше памяти.",
@@ -136,7 +145,7 @@ TRAINING_FIELD_HELP = {
     "Precision": "FP16 ускоряет CUDA-обучение; gradient checkpointing экономит память ценой скорости.",
     "Dataloader workers": "Число процессов подготовки батчей; 0 надёжнее на Windows.",
     "Memory": "Pin memory ускоряет передачу батчей на CUDA.",
-    "Сохранение": "Сохраняет параметры запуска и predictions на validation для анализа ошибок.",
+    "Сохранение": "Сохраняет параметры запуска и предсказания на валидационной выборке для анализа ошибок.",
     "Формат меток": "Одна метка читает ячейку целиком; список разбирает значения вида (3, 5, 7).",
     "Если меток несколько": "Что делать со строкой, где в одной ячейке найдено несколько меток.",
     "Схема обучения": "Оставить исходные классы для эмоций/тем/категорий или явно свести датасет к 3 sentiment-классам.",
@@ -294,6 +303,33 @@ def format_probabilities(probabilities: dict[str, float], limit: int = 6) -> str
     return text
 
 
+def compact_score_label(label: str) -> str:
+    mapping = {
+        POSITIVE: "Полож.",
+        NEUTRAL: "Нейтр.",
+        NEGATIVE: "Отриц.",
+    }
+    return mapping.get(label, label)
+
+
+def device_labels() -> list[str]:
+    labels = ["Auto", "CPU"]
+    try:
+        import torch
+    except ImportError:
+        return labels
+
+    if not torch.cuda.is_available():
+        return labels
+
+    device_count = torch.cuda.device_count()
+    for index in range(device_count):
+        name = torch.cuda.get_device_name(index)
+        label = f"CUDA ({name})" if device_count == 1 else f"CUDA {index} ({name})"
+        labels.append(label)
+    return labels
+
+
 def label_key(value: object) -> str:
     return str(value).strip().strip("'\"").casefold()
 
@@ -343,6 +379,12 @@ def make_combo(values: list[str], current: str) -> QComboBox:
     combo.addItems(values)
     if current in values:
         combo.setCurrentText(current)
+
+    combo.setObjectName("tableCombo")
+    combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    combo.setFixedHeight(32)
+    combo.setMinimumWidth(0)
+
     return combo
 
 
@@ -471,23 +513,82 @@ class ChartWidget(Panel):
             ax.spines[spine].set_visible(False)
         self.canvas.draw_idle()
 
+    def draw_training_result(self, result: TrainResult) -> None:
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        groups = ["Validation"]
+        accuracy = [result.accuracy]
+        macro_f1 = [result.macro_f1]
+        if result.test_size > 0:
+            groups.append("Test")
+            accuracy.append(result.test_accuracy)
+            macro_f1.append(result.test_macro_f1)
+
+        positions = range(len(groups))
+        width = 0.34
+        ax.bar([position - width / 2 for position in positions], accuracy, width, label="Accuracy", color="#7aa5dc")
+        ax.bar([position + width / 2 for position in positions], macro_f1, width, label="Macro F1", color="#d97706")
+        ax.set_ylim(0, 1)
+        ax.set_xticks(list(positions), groups)
+        ax.grid(axis="y", color="#e5e7eb", linewidth=0.8)
+        ax.legend(fontsize=8, frameon=False, loc="upper right")
+        ax.tick_params(labelsize=8)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        self.canvas.draw_idle()
+
 
 class TrainingThread(QThread):
     message = pyqtSignal(str)
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
+    canceled = pyqtSignal(str)
 
-    def __init__(self, texts: list[str], labels: list[object], config: TrainConfig) -> None:
+    def __init__(
+        self,
+        texts: list[str],
+        labels: list[object],
+        config: TrainConfig,
+        val_texts: list[str] | None = None,
+        val_labels: list[object] | None = None,
+        test_texts: list[str] | None = None,
+        test_labels: list[object] | None = None,
+    ) -> None:
         super().__init__()
         self.texts = texts
         self.labels = labels
         self.config = config
+        self.val_texts = val_texts
+        self.val_labels = val_labels
+        self.test_texts = test_texts
+        self.test_labels = test_labels
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    def should_stop(self) -> bool:
+        return self._stop_requested
 
     def run(self) -> None:
         try:
-            result = train_transformer_classifier(self.texts, self.labels, self.config, self.message.emit)
+            result = train_transformer_classifier(
+                self.texts,
+                self.labels,
+                self.config,
+                self.message.emit,
+                should_stop=self.should_stop,
+                val_texts=self.val_texts,
+                val_labels=self.val_labels,
+                test_texts=self.test_texts,
+                test_labels=self.test_labels,
+            )
         except TrainingError as exc:
-            self.failed.emit(str(exc))
+            message = str(exc)
+            if self._stop_requested or "прервано пользователем" in message.casefold():
+                self.canceled.emit(message)
+            else:
+                self.failed.emit(message)
         except Exception as exc:  # pragma: no cover
             self.failed.emit(f"Ошибка обучения: {exc}")
         else:
@@ -497,12 +598,21 @@ class TrainingThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Лаборатория анализа тональности")
+        self.setWindowTitle("Система анализа тональности текста")
+        self.setWindowIcon(QIcon(resource_path("assets/icons/app_icon.ico")))
         self.resize(1280, 820)
-        self.setMinimumSize(900, 580)
+        self.setMinimumSize(1100, 620)
 
         self.dataset_path: Path | None = None
         self.data_frame = pd.DataFrame()
+        self.analysis_dataset_path: Path | None = None
+        self.analysis_data_frame = pd.DataFrame()
+        self.val_dataset_path: Path | None = None
+        self.val_data_frame = pd.DataFrame()
+        self.test_dataset_path: Path | None = None
+        self.test_data_frame = pd.DataFrame()
+        self.preview_source = "train"
+        self.current_report_path: Path | None = None
         self.results: list[AnalysisResult] = []
         self.event_log: list[tuple[str, str]] = []
         self.preview_offset = 0
@@ -540,6 +650,8 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(body, 1)
         self.setCentralWidget(root)
         self.statusBar().showMessage("Готово. Загрузите датасет для начала работы.")
+        self.model_combo.currentTextChanged.connect(self._update_context_bar)
+        self.train_device_combo.currentTextChanged.connect(self._update_context_bar)
 
     def _build_context_bar(self) -> QWidget:
         bar = QFrame()
@@ -547,44 +659,65 @@ class MainWindow(QMainWindow):
 
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(SPACE_3, SPACE_2, SPACE_3, SPACE_2)
-        layout.setSpacing(SPACE_2)
+        layout.setSpacing(SPACE_3)
 
-        self.load_data_button = QPushButton("Загрузить датасет")
-        self.load_data_button.setObjectName("contextButton")
-        self.load_data_button.setToolTip("Открыть CSV, TXT или Excel-файл с текстовыми данными")
-        self.load_data_button.clicked.connect(self.load_dataset)
+        self.context_dataset_label = self._add_context_field(
+            layout,
+            "Датасет:",
+            "не загружен",
+            object_name="contextValue",
+            stretch=1,
+            min_width=160,
+        )
+        layout.addWidget(self._context_separator())
+        self.context_train_label = self._add_context_field(layout, "Train:", "0")
+        layout.addWidget(self._context_separator())
+        self.context_val_label = self._add_context_field(layout, "Val:", "—")
+        layout.addWidget(self._context_separator())
+        self.context_test_label = self._add_context_field(layout, "Test:", "—")
+        layout.addWidget(self._context_separator())
+        self.context_model_label = self._add_context_field(
+            layout, "Модель:", "—", min_width=140
+        )
+        layout.addWidget(self._context_separator())
+        self.context_device_label = self._add_context_field(layout, "Устройство:", "—")
+        layout.addWidget(self._context_separator())
 
-        dataset_title = QLabel("Файл:")
-        dataset_title.setObjectName("contextTitle")
-
-        self.dataset_name_label = QLabel("не загружен")
-        self.dataset_name_label.setObjectName("contextValue")
-        self.dataset_name_label.setMinimumWidth(180)
-        self.dataset_name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-        self.dataset_rows_label = QLabel("Строк: 0")
-        self.dataset_rows_label.setObjectName("contextSmallValue")
-
-        device_title = QLabel("Устройство:")
-        device_title.setObjectName("contextTitle")
-
-        self.device_combo = QComboBox()
-        self.device_combo.addItems(["CPU", "CUDA (0)", "Auto"])
-        self.device_combo.setObjectName("contextCombo")
-        self.device_combo.setFixedWidth(110)
-
-        layout.addWidget(self.load_data_button)
-        layout.addSpacing(4)
-
-        layout.addWidget(dataset_title)
-        layout.addWidget(self.dataset_name_label, 1)
-        layout.addWidget(self.dataset_rows_label)
-
-        layout.addSpacing(12)
-        layout.addWidget(device_title)
-        layout.addWidget(self.device_combo)
+        self.status_label = QLabel("● Готово")
+        self.status_label.setObjectName("statusChip")
+        self.status_label.setProperty("state", "ready")
+        self.status_label.setMinimumWidth(180)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
 
         return bar
+
+    def _add_context_field(
+        self,
+        layout: QHBoxLayout,
+        title: str,
+        value: str,
+        object_name: str = "contextSmallValue",
+        stretch: int = 0,
+        min_width: int = 0,
+    ) -> QLabel:
+        title_label = QLabel(title)
+        title_label.setObjectName("contextTitle")
+        value_label = QLabel(value)
+        value_label.setObjectName(object_name)
+        if min_width:
+            value_label.setMinimumWidth(min_width)
+        layout.addWidget(title_label)
+        if stretch:
+            layout.addWidget(value_label, stretch)
+        else:
+            layout.addWidget(value_label)
+        return value_label
+
+    def _context_separator(self) -> QLabel:
+        separator = QLabel("|")
+        separator.setObjectName("contextSeparator")
+        return separator
 
     def _build_sidebar(self) -> QWidget:
         side = QFrame()
@@ -598,7 +731,7 @@ class MainWindow(QMainWindow):
         nav_title = QLabel("НАВИГАЦИЯ")
         nav_title.setObjectName("sidebarSection")
         layout.addWidget(nav_title)
-        nav = ["Данные", "Анализ", "Обучение", "Модели", "Мониторинг", "Отчеты"]
+        nav = ["Данные", "Анализ", "Обучение", "Модели", "Мониторинг", "Отчёты"]
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for index, title in enumerate(nav):
@@ -611,37 +744,99 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
 
         layout.addStretch(1)
-        self.status_label = QLabel("Готово")
-        self.status_label.setObjectName("statusChip")
-        self.status_label.setProperty("state", "ready")
-        layout.addWidget(self.status_label)
         return side
 
     def _build_data_page(self) -> QWidget:
         page = self._page()
-        summary = Panel("Данные")
-        row = QHBoxLayout()
-        open_button = QPushButton("Загрузить датасет")
-        open_button.clicked.connect(self.load_dataset)
-        row.addWidget(open_button)
-        self.data_summary_label = QLabel("Файл не открыт. Поддерживаются CSV, TXT, XLSX/XLS.")
-        self.data_summary_label.setObjectName("mutedLabel")
-        row.addWidget(self.data_summary_label, 1)
-        summary.layout.addLayout(row)
+
+        summary = Panel("Наборы данных")
+        slots_grid = QGridLayout()
+        slots_grid.setHorizontalSpacing(SPACE_2)
+        slots_grid.setVerticalSpacing(SPACE_2)
+        slots_grid.setColumnStretch(3, 1)
+
+        self.train_load_button = QPushButton("Загрузить")
+        self.train_load_button.setObjectName("primaryButton")
+        self.train_load_button.clicked.connect(self.load_train_dataset)
+        self.train_clear_button = QPushButton("Очистить")
+        self.train_clear_button.clicked.connect(self.clear_train_dataset)
+        self.train_status_label = QLabel("Файл не открыт. Train обязателен для анализа и обучения.")
+        self.train_status_label.setObjectName("mutedLabel")
+        self.train_status_label.setWordWrap(True)
+        train_title = QLabel("Train")
+        train_title.setObjectName("formLabel")
+        slots_grid.addWidget(train_title, 0, 0)
+        slots_grid.addWidget(self.train_load_button, 0, 1)
+        slots_grid.addWidget(self.train_clear_button, 0, 2)
+        slots_grid.addWidget(self.train_status_label, 0, 3)
+
+        self.val_load_button = QPushButton("Загрузить")
+        self.val_load_button.clicked.connect(self.load_val_dataset)
+        self.val_clear_button = QPushButton("Очистить")
+        self.val_clear_button.clicked.connect(self.clear_val_dataset)
+        self.val_status_label = QLabel("Не загружен. Validation будет отделена из train по проценту в настройках обучения.")
+        self.val_status_label.setObjectName("mutedLabel")
+        self.val_status_label.setWordWrap(True)
+        val_title = QLabel("Validation")
+        val_title.setObjectName("formLabel")
+        slots_grid.addWidget(val_title, 1, 0)
+        slots_grid.addWidget(self.val_load_button, 1, 1)
+        slots_grid.addWidget(self.val_clear_button, 1, 2)
+        slots_grid.addWidget(self.val_status_label, 1, 3)
+
+        self.test_load_button = QPushButton("Загрузить")
+        self.test_load_button.clicked.connect(self.load_test_dataset)
+        self.test_clear_button = QPushButton("Очистить")
+        self.test_clear_button.clicked.connect(self.clear_test_dataset)
+        self.test_status_label = QLabel("Не загружен. Test будет отделён из train по проценту в настройках обучения.")
+        self.test_status_label.setObjectName("mutedLabel")
+        self.test_status_label.setWordWrap(True)
+        test_title = QLabel("Test")
+        test_title.setObjectName("formLabel")
+        slots_grid.addWidget(test_title, 2, 0)
+        slots_grid.addWidget(self.test_load_button, 2, 1)
+        slots_grid.addWidget(self.test_clear_button, 2, 2)
+        slots_grid.addWidget(self.test_status_label, 2, 3)
+
+        summary.layout.addLayout(slots_grid)
+        hybrid_hint = QLabel(
+            "Колонки текста и метки и таблица соответствия меток применяются ко всем загруженным файлам."
+        )
+        hybrid_hint.setObjectName("mutedLabel")
+        hybrid_hint.setWordWrap(True)
+        summary.layout.addWidget(hybrid_hint)
         page.layout().addWidget(summary)
 
         data_metrics = QGridLayout()
         data_metrics.setHorizontalSpacing(SPACE_3)
         data_metrics.setVerticalSpacing(SPACE_3)
-        self.dataset_rows_card = MetricCard("Строки", "0", "ожидает файл")
-        self.dataset_columns_card = MetricCard("Колонки", "0", "структура набора")
-        self.dataset_preview_card = MetricCard("Предпросмотр", "0", "строк в таблице")
-        for column, card in enumerate((self.dataset_rows_card, self.dataset_columns_card, self.dataset_preview_card)):
+        self.train_rows_card = MetricCard("Train", "0", "строк")
+        self.val_rows_card = MetricCard("Validation", "—", "не загружен")
+        self.test_rows_card = MetricCard("Test", "—", "не загружен")
+        self.dataset_columns_card = MetricCard("Колонки train", "0", "доступно для выбора")
+        for column, card in enumerate((
+            self.train_rows_card,
+            self.val_rows_card,
+            self.test_rows_card,
+            self.dataset_columns_card,
+        )):
             data_metrics.addWidget(card, 0, column)
             data_metrics.setColumnStretch(column, 1)
         page.layout().addLayout(data_metrics)
 
         preview = Panel("Предпросмотр")
+        source_row = QHBoxLayout()
+        source_row.setSpacing(SPACE_2)
+        source_row.addWidget(QLabel("Выборка:"))
+        self.preview_source_combo = QComboBox()
+        self.preview_source_combo.addItem("Train", "train")
+        self.preview_source_combo.addItem("Validation", "val")
+        self.preview_source_combo.addItem("Test", "test")
+        self.preview_source_combo.currentIndexChanged.connect(self._on_preview_source_changed)
+        source_row.addWidget(self.preview_source_combo)
+        source_row.addStretch(1)
+        preview.layout.addLayout(source_row)
+
         preview_controls = QHBoxLayout()
         preview_controls.setSpacing(SPACE_2)
         self.preview_range_label = QLabel("Строки 0-0 из 0")
@@ -690,20 +885,58 @@ class MainWindow(QMainWindow):
     def _build_analysis_page(self) -> QWidget:
         page = self._page()
 
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(SPACE_1)
+        self.analysis_mode_group = QButtonGroup(self)
+        self.analysis_mode_group.setExclusive(True)
+        batch_button = QPushButton("Пакетный анализ")
+        batch_button.setObjectName("modeButton")
+        batch_button.setCheckable(True)
+        batch_button.setChecked(True)
+        quick_button = QPushButton("Проверка текста")
+        quick_button.setObjectName("modeButton")
+        quick_button.setCheckable(True)
+        for index, button in enumerate((batch_button, quick_button)):
+            self.analysis_mode_group.addButton(button, index)
+            button.clicked.connect(lambda checked=False, page_index=index: self._switch_analysis_mode(page_index))
+            mode_row.addWidget(button)
+        mode_row.addStretch(1)
+        self.analysis_mode_hint = QLabel("Пакетный анализ использует отдельный файл анализа.")
+        self.analysis_mode_hint.setObjectName("mutedLabel")
+        mode_row.addWidget(self.analysis_mode_hint)
+        page.layout().addLayout(mode_row)
+
         settings = Panel("Параметры анализа")
         settings_form = QVBoxLayout()
         settings_form.setContentsMargins(0, 0, 0, 0)
         settings_form.setSpacing(SPACE_2)
 
-        source_row = QHBoxLayout()
-        source_row.setSpacing(SPACE_2)
+        analysis_data_row = QHBoxLayout()
+        analysis_data_row.setSpacing(SPACE_2)
+        self.analysis_load_button = QPushButton("Загрузить файл анализа")
+        self.analysis_load_button.setObjectName("primaryButton")
+        self.analysis_load_button.clicked.connect(self.load_analysis_dataset)
+        self.analysis_clear_button = QPushButton("Очистить")
+        self.analysis_clear_button.clicked.connect(self.clear_analysis_dataset)
+        self.analysis_dataset_label = QLabel("Файл для пакетного анализа не загружен.")
+        self.analysis_dataset_label.setObjectName("mutedLabel")
+        self.analysis_dataset_label.setWordWrap(True)
+        analysis_data_row.addWidget(QLabel("Файл:"))
+        analysis_data_row.addWidget(self.analysis_load_button)
+        analysis_data_row.addWidget(self.analysis_clear_button)
+        analysis_data_row.addWidget(self.analysis_dataset_label, 1)
+        settings_form.addLayout(analysis_data_row)
+        settings_form.addWidget(self._soft_separator())
 
         self.text_column_combo = QComboBox()
         self.text_column_combo.addItem("text")
         self.text_column_combo.setFixedWidth(176)
+        self.text_column_label = QLabel("Текст:")
 
         self.model_combo = QComboBox()
-        self.model_combo.addItems([str(profile["name"]) for profile in MODEL_PROFILES])
+        for model_path in self._inference_local_models():
+            if self.model_combo.findText(model_path) == -1:
+                self.model_combo.addItem(model_path)
         self.model_combo.setEditable(True)
         self.model_combo.setMinimumWidth(360)
         self.model_combo.currentTextChanged.connect(self.populate_profile_table)
@@ -719,12 +952,23 @@ class MainWindow(QMainWindow):
         self.analyze_button.setObjectName("primaryButton")
         self.analyze_button.clicked.connect(self.run_analysis)
 
-        source_row.addWidget(QLabel("Текст:"))
-        source_row.addWidget(self.text_column_combo)
-        source_row.addSpacing(SPACE_3)
-        source_row.addWidget(QLabel("Модель:"))
-        source_row.addWidget(self.model_combo, 1)
-        settings_form.addLayout(source_row)
+        self.browse_model_button = QPushButton("Выбрать папку…")
+        self.browse_model_button.setToolTip(
+            "Указать локальную папку с обученной моделью (config.json, model.safetensors, "
+            "tokenizer_config.json, special_tokens_map.json и т. п.)."
+        )
+        self.browse_model_button.clicked.connect(self.browse_custom_model)
+
+        model_row = QHBoxLayout()
+        model_row.setSpacing(SPACE_2)
+        model_row.addWidget(self.text_column_label)
+        model_row.addWidget(self.text_column_combo)
+        model_row.addSpacing(SPACE_4)
+        model_row.addWidget(QLabel("Модель:"))
+        model_row.addWidget(self.model_combo, 1)
+        model_row.addWidget(self.browse_model_button)
+        settings_form.addLayout(model_row)
+        settings_form.addWidget(self._soft_separator())
 
         preprocess_row = QHBoxLayout()
         preprocess_row.setSpacing(SPACE_3)
@@ -741,26 +985,9 @@ class MainWindow(QMainWindow):
         hint = QLabel("Для transformer-моделей агрессивную предобработку обычно лучше оставлять выключенной, если модель обучалась на сыром тексте.")
         hint.setObjectName("mutedLabel")
         hint.setWordWrap(True)
+        hint.setContentsMargins(0, 0, 0, 0)
         settings.layout.addWidget(hint)
         page.layout().addWidget(settings)
-
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(SPACE_1)
-        self.analysis_mode_group = QButtonGroup(self)
-        self.analysis_mode_group.setExclusive(True)
-        batch_button = QPushButton("Пакетный анализ")
-        batch_button.setObjectName("modeButton")
-        batch_button.setCheckable(True)
-        batch_button.setChecked(True)
-        quick_button = QPushButton("Один текст")
-        quick_button.setObjectName("modeButton")
-        quick_button.setCheckable(True)
-        for index, button in enumerate((batch_button, quick_button)):
-            self.analysis_mode_group.addButton(button, index)
-            button.clicked.connect(lambda checked=False, page_index=index: self._switch_analysis_mode(page_index))
-            mode_row.addWidget(button)
-        mode_row.addStretch(1)
-        page.layout().addLayout(mode_row)
 
         self.analysis_mode_stack = QStackedWidget()
         batch_page = QWidget()
@@ -797,8 +1024,8 @@ class MainWindow(QMainWindow):
 
     def _build_quick_analysis_panel(self) -> QWidget:
         panel = Panel()
-        row = QHBoxLayout()
-        row.setSpacing(SPACE_3)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
         input_box = QWidget()
         input_layout = QVBoxLayout(input_box)
@@ -817,13 +1044,9 @@ class MainWindow(QMainWindow):
         result_box = QFrame()
         result_box.setObjectName("quickResultPanel")
         result_box.setMinimumWidth(280)
-        result_box.setMaximumWidth(360)
         result_layout = QVBoxLayout(result_box)
         result_layout.setContentsMargins(SPACE_3, SPACE_3, SPACE_3, SPACE_3)
         result_layout.setSpacing(SPACE_3)
-
-        result_title = QLabel("Результат")
-        result_title.setObjectName("formLabel")
 
         self.quick_result_label = QLabel("Результат появится здесь")
         self.quick_result_label.setObjectName("quickResult")
@@ -832,25 +1055,46 @@ class MainWindow(QMainWindow):
         self.quick_probability_label = QLabel("Вероятности появятся после анализа")
         self.quick_probability_label.setObjectName("mutedLabel")
         self.quick_probability_label.setWordWrap(True)
+        self.quick_confidence_bar = QProgressBar()
+        self.quick_confidence_bar.setRange(0, 100)
+        self.quick_confidence_bar.setValue(0)
+        self.quick_confidence_bar.setFormat("Уверенность: %p%")
+
+        self.quick_probability_table = QTableWidget(0, 2)
+        self._configure_embedded_table(self.quick_probability_table)
+        self.quick_probability_table.setObjectName("quickProbabilityTable")
+        self.quick_probability_table.setHorizontalHeaderLabels(["Класс", "Вероятность"])
+        self.quick_probability_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.quick_probability_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.quick_probability_table.setColumnWidth(1, 92)
+        self.quick_probability_table.setMaximumHeight(180)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(SPACE_2)
-        self.quick_analyze_button = QPushButton("Проверить текст")
+        self.quick_analyze_button = QPushButton("Запустить анализ")
+        self.quick_analyze_button.setObjectName("primaryButton")
         self.quick_analyze_button.clicked.connect(self.run_quick_text_analysis)
         clear_button = QPushButton("Очистить")
         clear_button.clicked.connect(self.clear_quick_text_analysis)
         button_row.addWidget(self.quick_analyze_button, 1)
         button_row.addWidget(clear_button)
 
-        result_layout.addWidget(result_title)
         result_layout.addWidget(self.quick_result_label)
         result_layout.addWidget(self.quick_probability_label)
+        result_layout.addWidget(self.quick_confidence_bar)
+        result_layout.addWidget(self.quick_probability_table)
         result_layout.addStretch(1)
         result_layout.addLayout(button_row)
-        row.addWidget(input_box, 1)
-        row.addWidget(result_box)
 
-        panel.layout.addLayout(row)
+        splitter.addWidget(input_box)
+        splitter.addWidget(result_box)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([980, 280])
+
+        panel.layout.addWidget(splitter, 1)
         return panel
 
     def _build_results_panel(self) -> QWidget:
@@ -858,7 +1102,7 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         self.result_count_label = QLabel("Всего: 0")
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Фильтр по тексту, классу или источнику")
+        self.filter_edit.setPlaceholderText("Фильтр по тексту или классу")
         self.filter_edit.setMinimumWidth(220)
         self.filter_edit.textChanged.connect(self.apply_filter)
         header.addWidget(self.result_count_label)
@@ -866,15 +1110,14 @@ class MainWindow(QMainWindow):
         header.addWidget(self.filter_edit)
         panel.layout.addLayout(header)
 
-        self.results_table = QTableWidget(0, 5)
+        self.results_table = QTableWidget(0, 4)
         self._configure_embedded_table(self.results_table)
-        self.results_table.setHorizontalHeaderLabels(["#", "Текст", "Класс", "Увер.", "Источник"])
+        self.results_table.setHorizontalHeaderLabels(["#", "Текст", "Класс", "Увер."])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.results_table.setColumnWidth(0, 45)
         self.results_table.setColumnWidth(2, 125)
         self.results_table.setColumnWidth(3, 80)
-        self.results_table.setColumnWidth(4, 120)
         panel.layout.addWidget(self.results_table, 1)
         return panel
 
@@ -955,6 +1198,12 @@ class MainWindow(QMainWindow):
         self.train_val_split_spin.setRange(0.05, 0.5)
         self.train_val_split_spin.setSingleStep(0.05)
         self.train_val_split_spin.setValue(0.2)
+        self.train_test_split_spin = QDoubleSpinBox()
+        self.train_test_split_spin.setDecimals(2)
+        self.train_test_split_spin.setRange(0.0, 0.5)
+        self.train_test_split_spin.setSingleStep(0.05)
+        self.train_test_split_spin.setValue(0.1)
+        self.train_test_split_spin.setSpecialValueText("без test")
         self.train_stratify_check = QCheckBox("Стратифицировать по метке")
         self.train_stratify_check.setChecked(True)
         self.train_split_seed_spin = QSpinBox()
@@ -967,6 +1216,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(
             self._training_tab([
                 ("Validation split", self.train_val_split_spin),
+                ("Test split", self.train_test_split_spin),
                 ("Split seed", self.train_split_seed_spin),
                 ("Стратегия", self.train_stratify_check),
                 ("Веса классов", self.train_class_weights_combo),
@@ -979,7 +1229,7 @@ class MainWindow(QMainWindow):
         self.train_base_model_combo.addItems(TRAINING_BASE_MODELS)
         self.train_base_model_combo.setEditable(True)
         self.train_local_only_check = QCheckBox("Только локальные файлы")
-        self.train_local_only_check.setChecked(True)
+        self.train_local_only_check.setChecked(False)
         self.train_trust_remote_check = QCheckBox("trust_remote_code")
         self.train_ignore_mismatch_check = QCheckBox("Переинициализировать голову при несовпадении")
         self.train_ignore_mismatch_check.setChecked(True)
@@ -1112,7 +1362,7 @@ class MainWindow(QMainWindow):
         self.train_early_patience_spin.setRange(1, 20)
         self.train_early_patience_spin.setValue(2)
         self.train_device_combo = QComboBox()
-        self.train_device_combo.addItems(["Auto", "CPU", "CUDA (0)"])
+        self.train_device_combo.addItems(device_labels())
         self.train_fp16_check = QCheckBox("FP16 на CUDA")
         self.train_gradient_checkpointing_check = QCheckBox("Gradient checkpointing")
         self.train_workers_spin = QSpinBox()
@@ -1153,26 +1403,57 @@ class MainWindow(QMainWindow):
         self.train_button = QPushButton("Запустить обучение")
         self.train_button.setObjectName("primaryButton")
         self.train_button.clicked.connect(self.start_training)
-        settings.layout.addWidget(self.train_button)
-        settings.setMinimumWidth(660)
+        self.cancel_train_button = QPushButton("Прервать")
+        self.cancel_train_button.setObjectName("dangerButton")
+        self.cancel_train_button.clicked.connect(self.cancel_training)
+        self.cancel_train_button.setEnabled(False)
+        train_actions = QHBoxLayout()
+        train_actions.setSpacing(SPACE_2)
+        train_actions.addWidget(self.train_button, 1)
+        train_actions.addWidget(self.cancel_train_button)
+        settings.layout.addLayout(train_actions)
+        settings.setMinimumWidth(420)
+        settings.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         splitter.addWidget(settings)
 
         progress_panel = Panel("Ход обучения")
         progress_panel.setObjectName("workbenchPanel")
+        progress_panel.setMinimumWidth(260)
+        progress_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.training_progress = QProgressBar()
         self.training_progress.setRange(0, 1)
         self.training_progress.setValue(0)
+        self.training_metrics_chart = ChartWidget("Итоги обучения", 176)
+        self.training_metrics_chart.empty("Метрики появятся после обучения")
         self.training_log = QPlainTextEdit()
+        self.training_log.setObjectName("trainingLog")
         self.training_log.setReadOnly(True)
-        self.training_log.setPlaceholderText("Здесь появятся сообщения обучения.")
+        self.training_log_stack = QStackedWidget()
+        self.training_log_stack.setObjectName("trainingLogStack")
+        log_empty = QFrame()
+        log_empty.setObjectName("trainingLogEmpty")
+        log_empty_layout = QVBoxLayout(log_empty)
+        log_empty_layout.setContentsMargins(SPACE_3, SPACE_3, SPACE_3, SPACE_3)
+        log_empty_layout.addStretch(1)
+        log_empty_label = QLabel("Сообщения появятся при обучении")
+        log_empty_label.setObjectName("emptyLogMessage")
+        log_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        log_empty_layout.addWidget(log_empty_label)
+        log_empty_layout.addStretch(1)
+        self.training_log_stack.addWidget(log_empty)
+        self.training_log_stack.addWidget(self.training_log)
         progress_panel.layout.addWidget(self.training_progress)
-        progress_panel.layout.addWidget(self.training_log, 1)
+        progress_panel.layout.addWidget(self.training_metrics_chart)
+        progress_panel.layout.addWidget(self.training_log_stack, 1)
         splitter.addWidget(progress_panel)
         splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([680, 560])
+        splitter.setCollapsible(1, True)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        splitter.setChildrenCollapsible(True)
+        splitter.setSizes([620, 360])
         page.layout().addWidget(splitter, 1)
         return page
 
@@ -1203,9 +1484,9 @@ class MainWindow(QMainWindow):
         self.target_scheme_combo.addItems([ORIGINAL_SCHEME, SENTIMENT_SCHEME])
         self.target_scheme_combo.currentTextChanged.connect(self.refresh_label_mapping_table)
 
-        auto_button = QPushButton("Автонастроить")
+        auto_button = QPushButton("Автонастроить метки")
         auto_button.clicked.connect(self.auto_configure_label_mapping)
-        apply_button = QPushButton("Проверить")
+        apply_button = QPushButton("Проверить разметку")
         apply_button.clicked.connect(self.update_label_mapping_summary)
 
         form.addWidget(self._field_label("Формат меток"), 0, 0)
@@ -1225,10 +1506,12 @@ class MainWindow(QMainWindow):
         self.label_mapping_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.label_mapping_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.label_mapping_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.label_mapping_table.setColumnWidth(1, 64)
-        self.label_mapping_table.setColumnWidth(2, 176)
-        self.label_mapping_table.verticalHeader().setDefaultSectionSize(40)
-        self.label_mapping_table.verticalHeader().setMinimumSectionSize(40)
+
+        self.label_mapping_table.setColumnWidth(1, 72)
+        self.label_mapping_table.setColumnWidth(2, 220)
+
+        self.label_mapping_table.verticalHeader().setDefaultSectionSize(44)
+        self.label_mapping_table.verticalHeader().setMinimumSectionSize(44)
         layout.addWidget(self.label_mapping_table, 1)
 
         self.label_mapping_summary = QLabel("Загрузите датасет и выберите колонку метки.")
@@ -1241,26 +1524,23 @@ class MainWindow(QMainWindow):
         page = self._page()
         panel = Panel("Модели и справочные профили")
         note = QLabel(
-            "Accuracy, Macro F1 и скорость являются справочными показателями профиля, "
-            "а не результатом текущего анализа."
+            "Обученные локальные модели доступны для анализа. Базовые checkpoints нужны для fine-tuning и не добавляются в список анализа."
         )
         note.setWordWrap(True)
         note.setObjectName("mutedLabel")
         panel.layout.addWidget(note)
-        self.profile_table = QTableWidget(0, 6)
+        self.profile_table = QTableWidget(0, 5)
         self._configure_embedded_table(self.profile_table)
-        self.profile_table.setHorizontalHeaderLabels(["Модель", "Статус", "Accuracy", "Macro F1", "Уверенность", "Скорость"])
+        self.profile_table.setHorizontalHeaderLabels(["Модель", "Источник", "Accuracy", "Macro F1", "Уверенность"])
         self.profile_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.profile_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.profile_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.profile_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.profile_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.profile_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         self.profile_table.setColumnWidth(1, 112)
         self.profile_table.setColumnWidth(2, 88)
         self.profile_table.setColumnWidth(3, 88)
         self.profile_table.setColumnWidth(4, 108)
-        self.profile_table.setColumnWidth(5, 96)
         self.profile_table.cellDoubleClicked.connect(self._select_model_from_profile)
         panel.layout.addWidget(self.profile_table, 1)
         page.layout().addWidget(panel, 1)
@@ -1268,6 +1548,23 @@ class MainWindow(QMainWindow):
 
     def _build_monitoring_page(self) -> QWidget:
         page = self._page()
+        self.monitoring_stack = QStackedWidget()
+
+        self.monitoring_stack.addWidget(
+            self._empty_state_panel(
+                title="Мониторинг появится после анализа",
+                message="Запустите пакетный анализ, чтобы здесь появились динамика уверенности, распределение классов и сводка дрейфа.",
+                action_label="Перейти к анализу",
+                action_callback=lambda: self._switch_page(1),
+                secondary_label="К данным",
+                secondary_callback=lambda: self._switch_page(0),
+            )
+        )
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(SPACE_3)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.drift_chart = ChartWidget("Динамика уверенности и распределений", 320)
         splitter.addWidget(self.drift_chart)
@@ -1288,23 +1585,135 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([760, 320])
-        page.layout().addWidget(splitter, 1)
+        content_layout.addWidget(splitter, 1)
+        self.monitoring_stack.addWidget(content)
+
+        page.layout().addWidget(self.monitoring_stack, 1)
         return page
 
     def _build_reports_page(self) -> QWidget:
         page = self._page()
-        panel = Panel("Экспорт отчета")
-        text = QLabel("HTML-отчет включает сведения о выбранной модели, сводку результатов и первые 500 строк анализа.")
-        text.setWordWrap(True)
-        text.setObjectName("mutedLabel")
-        export_button = QPushButton("Экспортировать HTML-отчет")
+        self.reports_stack = QStackedWidget()
+
+        self.reports_stack.addWidget(
+            self._empty_state_panel(
+                title="Отчёт сформируется после анализа",
+                message="После запуска пакетного анализа здесь можно будет экспортировать HTML-отчёт с результатами и метриками.",
+                action_label="Перейти к анализу",
+                action_callback=lambda: self._switch_page(1),
+                secondary_label="К данным",
+                secondary_callback=lambda: self._switch_page(0),
+            )
+        )
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(SPACE_3)
+        panel = Panel("HTML-отчёт")
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(SPACE_2)
+        export_button = QPushButton("Сохранить HTML")
         export_button.clicked.connect(self.export_report)
-        panel.layout.addWidget(text)
-        panel.layout.addWidget(export_button)
-        panel.layout.addStretch(1)
-        page.layout().addWidget(panel)
-        page.layout().addStretch(1)
+        toolbar.addWidget(export_button)
+        toolbar.addStretch(1)
+
+        self.report_view = QTextBrowser()
+        self.report_view.setObjectName("reportPreview")
+        self.report_view.setOpenExternalLinks(True)
+        self.report_view.setHtml(
+            "<div style='height:100%; display:flex; align-items:center; justify-content:center; "
+            "font-family:Segoe UI, Arial; color:#6b7280; font-size:14px;'>"
+            "Предпросмотр появится после формирования отчёта"
+            "</div>"
+        )
+
+        panel.layout.addLayout(toolbar)
+        panel.layout.addWidget(self.report_view, 1)
+        content_layout.addWidget(panel)
+        self.reports_stack.addWidget(content)
+
+        page.layout().addWidget(self.reports_stack, 1)
         return page
+
+    def _empty_state_panel(
+        self,
+        title: str,
+        message: str,
+        action_label: str | None = None,
+        action_callback=None,
+        *,
+        kicker: str | None = None,
+        steps: list[str] | None = None,
+        secondary_label: str | None = None,
+        secondary_callback=None,
+    ) -> QWidget:
+        wrapper = QWidget()
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(SPACE_4, SPACE_4, SPACE_4, SPACE_4)
+        outer.setSpacing(SPACE_2)
+        outer.addStretch(1)
+
+        if kicker:
+            kicker_label = QLabel(kicker.upper())
+            kicker_label.setObjectName("emptyStateKicker")
+            kicker_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            outer.addWidget(kicker_label)
+
+        if title:
+            title_label = QLabel(title)
+            title_label.setObjectName("emptyStateTitle")
+            title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            title_label.setWordWrap(True)
+            outer.addWidget(title_label)
+
+        message_label = QLabel(message)
+        message_label.setObjectName("emptyStateMessage")
+        message_label.setWordWrap(True)
+        message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        message_label.setMaximumWidth(520)
+        message_container = QHBoxLayout()
+        message_container.addStretch(1)
+        message_container.addWidget(message_label)
+        message_container.addStretch(1)
+        outer.addLayout(message_container)
+
+        if steps:
+            steps_widget = QWidget()
+            steps_layout = QVBoxLayout(steps_widget)
+            steps_layout.setContentsMargins(0, SPACE_2, 0, SPACE_2)
+            steps_layout.setSpacing(SPACE_1)
+            for index, step in enumerate(steps, start=1):
+                step_label = QLabel(f"{index}.  {step}")
+                step_label.setObjectName("emptyStateStepText")
+                step_label.setWordWrap(True)
+                step_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                steps_layout.addWidget(step_label)
+            steps_widget.setMaximumWidth(520)
+            steps_row = QHBoxLayout()
+            steps_row.addStretch(1)
+            steps_row.addWidget(steps_widget)
+            steps_row.addStretch(1)
+            outer.addLayout(steps_row)
+
+        if action_label and action_callback is not None:
+            button_row = QHBoxLayout()
+            button_row.setSpacing(SPACE_2)
+            button_row.addStretch(1)
+            action_button = QPushButton(action_label)
+            action_button.setObjectName("primaryButton")
+            action_button.clicked.connect(action_callback)
+            button_row.addWidget(action_button)
+            if secondary_label and secondary_callback is not None:
+                secondary_button = QPushButton(secondary_label)
+                secondary_button.clicked.connect(secondary_callback)
+                button_row.addWidget(secondary_button)
+            button_row.addStretch(1)
+            outer.addSpacing(SPACE_2)
+            outer.addLayout(button_row)
+
+        outer.addStretch(1)
+        return wrapper
 
     def _training_tab(self, rows: list[tuple[str, QWidget]]) -> QWidget:
         content = QWidget()
@@ -1376,6 +1785,13 @@ class MainWindow(QMainWindow):
             layout.addWidget(widget)
         return wrapper
 
+    def _soft_separator(self) -> QFrame:
+        separator = QFrame()
+        separator.setObjectName("softSeparator")
+        separator.setFrameShape(QFrame.Shape.NoFrame)
+        separator.setFixedHeight(1)
+        return separator
+
     def _page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1397,19 +1813,36 @@ class MainWindow(QMainWindow):
         table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def _set_status(self, text: str, state: str = "ready") -> None:
-        self.status_label.setText(text)
-        self.status_label.setProperty("state", state)
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
+        if hasattr(self, "status_label"):
+            self.status_label.setText(f"● {text}")
+            self.status_label.setProperty("state", state)
+            self.status_label.style().unpolish(self.status_label)
+            self.status_label.style().polish(self.status_label)
+        bar = self.statusBar()
+        bar.setProperty("state", state)
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
+        bar.showMessage(text)
 
     def _set_initial_state(self) -> None:
         self.analyze_button.setEnabled(False)
+        self.analysis_clear_button.setEnabled(False)
         self.train_button.setEnabled(False)
         self._switch_page(0)
         self.populate_profile_table()
         self._refresh_empty_charts()
+        self._refresh_workflow_state()
+        self._refresh_dataset_summary()
+        self._update_context_bar()
         self._log("Готово. Загрузите датасет для начала работы.")
         self.refresh_label_mapping_table()
+
+    def _refresh_workflow_state(self) -> None:
+        has_results = bool(self.results)
+        if hasattr(self, "monitoring_stack"):
+            self.monitoring_stack.setCurrentIndex(1 if has_results else 0)
+        if hasattr(self, "reports_stack"):
+            self.reports_stack.setCurrentIndex(1 if has_results else 0)
 
     def _switch_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
@@ -1418,11 +1851,23 @@ class MainWindow(QMainWindow):
 
     def _switch_analysis_mode(self, index: int) -> None:
         self.analysis_mode_stack.setCurrentIndex(index)
+        is_batch = index == 0
+        self.analyze_button.setVisible(is_batch)
+        self.text_column_combo.setVisible(is_batch)
+        self.text_column_label.setVisible(is_batch)
+        self.analysis_load_button.setVisible(is_batch)
+        self.analysis_clear_button.setVisible(is_batch)
+        self.analysis_dataset_label.setVisible(is_batch)
+        if hasattr(self, "analysis_mode_hint"):
+            if is_batch:
+                self.analysis_mode_hint.setText("Пакетный анализ использует отдельный файл анализа, не train-датасет.")
+            else:
+                self.analysis_mode_hint.setText("Быстрая проверка одной строки без загрузки датасета.")
 
-    def load_dataset(self) -> None:
+    def load_train_dataset(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Загрузить набор текстовых данных",
+            "Загрузить train-датасет",
             str(Path.cwd()),
             "Текстовые данные (*.csv *.txt *.xlsx *.xls);;CSV (*.csv);;Excel (*.xlsx *.xls);;TXT (*.txt)",
         )
@@ -1436,59 +1881,338 @@ class MainWindow(QMainWindow):
             return
 
         self.dataset_path = Path(path)
-        self.dataset_name_label.setText(self.dataset_path.name)
-        self.dataset_name_label.setToolTip(str(self.dataset_path))
-        self.dataset_rows_label.setText(f"строк: {format_int(len(self.data_frame))}")
-        self._populate_column_combo()
         self._populate_training_columns()
         self.results = []
         self.preview_offset = 0
-        self.populate_preview_table()
+        self._refresh_dataset_summary()
         self.populate_results_table([])
         self.refresh_analysis()
         self.refresh_label_mapping_table()
-        self.analyze_button.setEnabled(True)
         self.train_button.setEnabled(True)
-        self.data_summary_label.setText(
-            f"{self.dataset_path.name}: {format_int(len(self.data_frame))} строк, {len(self.data_frame.columns)} колонок."
-        )
-        self.dataset_rows_card.set_values(format_int(len(self.data_frame)), "в наборе данных")
-        self.dataset_columns_card.set_values(format_int(len(self.data_frame.columns)), "доступно для выбора")
         self._set_status("Данные загружены", "ready")
-        self.statusBar().showMessage("Данные загружены. Выберите колонку и запустите анализ или настройте метки для обучения.")
-        self._log(f"Данные загружены: {self.dataset_path.name} ({len(self.data_frame)} строк).")
+        self.statusBar().showMessage(
+            "Train загружен. Можно загрузить отдельные validation/test или оставить разбиение по проценту."
+        )
+        self._log(f"Train загружен: {self.dataset_path.name} ({len(self.data_frame)} строк).")
+        self._refresh_workflow_state()
         self._switch_page(0)
 
-    def run_analysis(self) -> None:
+    def clear_train_dataset(self) -> None:
         if self.data_frame.empty:
-            QMessageBox.information(self, "Нет данных", "Сначала загрузите CSV, TXT или Excel файл.")
+            return
+        self.data_frame = pd.DataFrame()
+        self.dataset_path = None
+        self.results = []
+        self.preview_offset = 0
+        self.train_text_column_combo.clear()
+        self.train_text_column_combo.addItem("text")
+        self.train_label_column_combo.blockSignals(True)
+        self.train_label_column_combo.clear()
+        self.train_label_column_combo.blockSignals(False)
+        self.train_button.setEnabled(False)
+        self._refresh_dataset_summary()
+        self.populate_results_table([])
+        self.refresh_analysis()
+        self.refresh_label_mapping_table()
+        self._set_status("Train очищен", "ready")
+        self._log("Train-датасет очищен.")
+        self._refresh_workflow_state()
+
+    def load_analysis_dataset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Загрузить файл для пакетного анализа",
+            str(Path.cwd()),
+            "Текстовые данные (*.csv *.txt *.xlsx *.xls);;CSV (*.csv);;Excel (*.xlsx *.xls);;TXT (*.txt)",
+        )
+        if not path:
+            return
+
+        try:
+            self.analysis_data_frame = self._read_dataset(Path(path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка загрузки", str(exc))
+            return
+
+        self.analysis_dataset_path = Path(path)
+        self.results = []
+        self._populate_analysis_columns()
+        self.refresh_analysis()
+        self.analyze_button.setEnabled(True)
+        self.analysis_clear_button.setEnabled(True)
+        self.analysis_dataset_label.setText(
+            f"{self.analysis_dataset_path.name}: {format_int(len(self.analysis_data_frame))} строк, "
+            f"{len(self.analysis_data_frame.columns)} колонок."
+        )
+        self.analysis_dataset_label.setToolTip(str(self.analysis_dataset_path))
+        self._set_status("Данные анализа загружены", "ready")
+        self._log(f"Файл анализа загружен: {self.analysis_dataset_path.name} ({len(self.analysis_data_frame)} строк).")
+        self._switch_page(1)
+
+    def clear_analysis_dataset(self) -> None:
+        if self.analysis_data_frame.empty:
+            return
+        self.analysis_data_frame = pd.DataFrame()
+        self.analysis_dataset_path = None
+        self.results = []
+        self.text_column_combo.clear()
+        self.text_column_combo.addItem("text")
+        self.analysis_dataset_label.setText("Файл для пакетного анализа не загружен.")
+        self.analysis_dataset_label.setToolTip("")
+        self.analyze_button.setEnabled(False)
+        self.analysis_clear_button.setEnabled(False)
+        self.populate_results_table([])
+        self.refresh_analysis()
+        self._set_status("Файл анализа очищен", "ready")
+        self._log("Файл пакетного анализа очищен.")
+
+    def load_val_dataset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Загрузить validation-датасет",
+            str(Path.cwd()),
+            "Текстовые данные (*.csv *.txt *.xlsx *.xls);;CSV (*.csv);;Excel (*.xlsx *.xls);;TXT (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            self.val_data_frame = self._read_dataset(Path(path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка загрузки", str(exc))
+            return
+        self.val_dataset_path = Path(path)
+        self._refresh_dataset_summary()
+        self.refresh_label_mapping_table()
+        self.statusBar().showMessage(
+            f"Validation загружен: {self.val_dataset_path.name} ({format_int(len(self.val_data_frame))} строк)."
+        )
+        self._log(f"Validation загружен: {self.val_dataset_path.name} ({len(self.val_data_frame)} строк).")
+        if self.preview_source != "train":
+            self.populate_preview_table()
+
+    def clear_val_dataset(self) -> None:
+        if self.val_data_frame.empty:
+            return
+        self.val_data_frame = pd.DataFrame()
+        self.val_dataset_path = None
+        self._refresh_dataset_summary()
+        self.refresh_label_mapping_table()
+        if self.preview_source == "val":
+            self.preview_offset = 0
+            self.populate_preview_table()
+        self._log("Validation-датасет очищен.")
+
+    def load_test_dataset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Загрузить test-датасет",
+            str(Path.cwd()),
+            "Текстовые данные (*.csv *.txt *.xlsx *.xls);;CSV (*.csv);;Excel (*.xlsx *.xls);;TXT (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            self.test_data_frame = self._read_dataset(Path(path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка загрузки", str(exc))
+            return
+        self.test_dataset_path = Path(path)
+        self._refresh_dataset_summary()
+        self.refresh_label_mapping_table()
+        self.statusBar().showMessage(
+            f"Test загружен: {self.test_dataset_path.name} ({format_int(len(self.test_data_frame))} строк)."
+        )
+        self._log(f"Test загружен: {self.test_dataset_path.name} ({len(self.test_data_frame)} строк).")
+        if self.preview_source != "train":
+            self.populate_preview_table()
+
+    def clear_test_dataset(self) -> None:
+        if self.test_data_frame.empty:
+            return
+        self.test_data_frame = pd.DataFrame()
+        self.test_dataset_path = None
+        self._refresh_dataset_summary()
+        self.refresh_label_mapping_table()
+        if self.preview_source == "test":
+            self.preview_offset = 0
+            self.populate_preview_table()
+        self._log("Test-датасет очищен.")
+
+    def _refresh_dataset_summary(self) -> None:
+        train_loaded = not self.data_frame.empty
+        val_loaded = not self.val_data_frame.empty
+        test_loaded = not self.test_data_frame.empty
+
+        if train_loaded and self.dataset_path is not None:
+            self.train_status_label.setText(
+                f"{self.dataset_path.name}: {format_int(len(self.data_frame))} строк, "
+                f"{len(self.data_frame.columns)} колонок."
+            )
+            self.train_rows_card.set_values(format_int(len(self.data_frame)), "строк")
+            self.dataset_columns_card.set_values(
+                format_int(len(self.data_frame.columns)),
+                "доступно для выбора",
+            )
+        else:
+            self.train_status_label.setText(
+                "Файл не открыт. Train обязателен для обучения."
+            )
+            self.train_rows_card.set_values("0", "строк")
+            self.dataset_columns_card.set_values("0", "доступно для выбора")
+        self.train_clear_button.setEnabled(train_loaded)
+
+        if val_loaded and self.val_dataset_path is not None:
+            self.val_status_label.setText(
+                f"{self.val_dataset_path.name}: {format_int(len(self.val_data_frame))} строк, "
+                f"{len(self.val_data_frame.columns)} колонок."
+            )
+            self.val_rows_card.set_values(format_int(len(self.val_data_frame)), "из отдельного файла")
+        else:
+            self.val_status_label.setText(
+                "Не загружен. Validation будет отделена из train по проценту в настройках обучения."
+            )
+            self.val_rows_card.set_values("—", "не загружен")
+        self.val_clear_button.setEnabled(val_loaded)
+
+        if test_loaded and self.test_dataset_path is not None:
+            self.test_status_label.setText(
+                f"{self.test_dataset_path.name}: {format_int(len(self.test_data_frame))} строк, "
+                f"{len(self.test_data_frame.columns)} колонок."
+            )
+            self.test_rows_card.set_values(format_int(len(self.test_data_frame)), "из отдельного файла")
+        else:
+            self.test_status_label.setText(
+                "Не загружен. Test будет отделён из train по проценту в настройках обучения."
+            )
+            self.test_rows_card.set_values("—", "не загружен")
+        self.test_clear_button.setEnabled(test_loaded)
+
+        self._refresh_validation_split_state()
+        self.populate_preview_table()
+        self._update_context_bar()
+
+    def _update_context_bar(self) -> None:
+        if not hasattr(self, "context_dataset_label"):
+            return
+
+        if self.dataset_path is not None and not self.data_frame.empty:
+            self.context_dataset_label.setText(self.dataset_path.name)
+            self.context_dataset_label.setToolTip(str(self.dataset_path))
+        else:
+            self.context_dataset_label.setText("не загружен")
+            self.context_dataset_label.setToolTip("")
+
+        if not self.data_frame.empty:
+            self.context_train_label.setText(format_int(len(self.data_frame)))
+        else:
+            self.context_train_label.setText("0")
+
+        if not self.val_data_frame.empty:
+            self.context_val_label.setText(format_int(len(self.val_data_frame)))
+        else:
+            self.context_val_label.setText("—")
+
+        if not self.test_data_frame.empty:
+            self.context_test_label.setText(format_int(len(self.test_data_frame)))
+        else:
+            self.context_test_label.setText("—")
+
+        model_name = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
+        self.context_model_label.setText(self._format_context_model(model_name))
+        self.context_model_label.setToolTip(model_name)
+
+        device = self._analysis_device()
+        self.context_device_label.setText(self._format_context_device(device))
+        self.context_device_label.setToolTip(device)
+
+    @staticmethod
+    def _format_context_model(model_name: str) -> str:
+        name = model_name.strip()
+        if not name:
+            return "—"
+        path = Path(name)
+        if path.exists() or name.startswith("models/") or "\\" in name or (":" in name and "/" not in name):
+            return path.name
+        return name
+
+    @staticmethod
+    def _format_context_device(device: str) -> str:
+        value = (device or "").strip()
+        if not value or value == "Auto":
+            return "CPU"
+        if value.startswith("CUDA"):
+            return "GPU"
+        return value
+
+    def _current_preview_frame(self) -> pd.DataFrame:
+        if self.preview_source == "val":
+            return self.val_data_frame
+        if self.preview_source == "test":
+            return self.test_data_frame
+        return self.data_frame
+
+    def _on_preview_source_changed(self, _index: int) -> None:
+        data = self.preview_source_combo.currentData()
+        self.preview_source = str(data) if data is not None else "train"
+        self.preview_offset = 0
+        self.populate_preview_table()
+
+    def _refresh_validation_split_state(self) -> None:
+        if not hasattr(self, "train_val_split_spin"):
+            return
+        external_val = not self.val_data_frame.empty
+        external_test = not self.test_data_frame.empty
+        self.train_val_split_spin.setEnabled(not external_val)
+        self.train_test_split_spin.setEnabled(not external_test)
+        # split_seed / stratify влияют на оба сплита — оставляем активными, если хотя бы один сплит нужен
+        any_split = not external_val or not external_test
+        self.train_split_seed_spin.setEnabled(any_split)
+        self.train_stratify_check.setEnabled(any_split)
+        self.train_val_split_spin.setToolTip(
+            "Валидационная выборка загружена из отдельного файла, процентное разбиение не применяется."
+            if external_val
+            else TRAINING_FIELD_HELP.get("Validation split", "")
+        )
+        self.train_test_split_spin.setToolTip(
+            "Тестовая выборка загружена из отдельного файла, процентное разбиение не применяется."
+            if external_test
+            else TRAINING_FIELD_HELP.get("Test split", "")
+        )
+
+    def run_analysis(self) -> None:
+        if self.analysis_data_frame.empty:
+            QMessageBox.information(
+                self,
+                "Нет данных для анализа",
+                "Загрузите отдельный файл для пакетного анализа на странице «Анализ».",
+            )
             return
         text_column = self.text_column_combo.currentText()
-        if text_column not in self.data_frame.columns:
+        if text_column not in self.analysis_data_frame.columns:
             QMessageBox.warning(self, "Колонка не найдена", "Выберите колонку с текстом.")
             return
 
-        source_column = self._guess_source_column()
+        source_column = self._guess_source_column(self.analysis_data_frame)
         options = self._analysis_options()
         self._set_status("Загрузка модели", "running")
-        self.statusBar().showMessage("Загрузка transformer-модели...")
+        self.statusBar().showMessage("Загрузка модели...")
         QApplication.processEvents()
 
         try:
-            analyzer = SentimentAnalyzer(self.model_combo.currentText(), options, self.device_combo.currentText())
-            self._log(f"Transformer-модель загружена: {self.model_combo.currentText()}.")
-            self._set_status("Анализ", "running")
+            analyzer = SentimentAnalyzer(self.model_combo.currentText(), options, self._analysis_device())
+            self._log(f"Модель загружена: {self.model_combo.currentText()}.")
+            self._set_status("Анализ выполняется", "running")
             self.statusBar().showMessage("Выполняется анализ...")
             QApplication.processEvents()
             self.results = analyzer.analyze(
-                self.data_frame[text_column].fillna("").astype(str).tolist(),
-                self.data_frame[source_column].fillna("").astype(str).tolist() if source_column else None,
+                self.analysis_data_frame[text_column].fillna("").astype(str).tolist(),
+                self.analysis_data_frame[source_column].fillna("").astype(str).tolist() if source_column else None,
             )
         except TransformerLoadError as exc:
-            self._set_status("Ошибка модели", "error")
-            self.statusBar().showMessage("Ошибка transformer-модели.")
-            self._log(f"Ошибка transformer-модели: {exc}")
-            QMessageBox.critical(self, "Ошибка transformer-модели", str(exc))
+            self._set_status("Ошибка", "error")
+            self.statusBar().showMessage("Ошибка модели.")
+            self._log(f"Ошибка модели: {exc}")
+            QMessageBox.critical(self, "Ошибка модели", str(exc))
             return
 
         self._set_status("Готово", "ready")
@@ -1508,10 +2232,10 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         try:
-            analyzer = SentimentAnalyzer(self.model_combo.currentText(), self._analysis_options(), self.device_combo.currentText())
+            analyzer = SentimentAnalyzer(self.model_combo.currentText(), self._analysis_options(), self._analysis_device())
             result = analyzer.analyze([text])[0]
         except TransformerLoadError as exc:
-            self._set_status("Ошибка модели", "error")
+            self._set_status("Ошибка", "error")
             self.statusBar().showMessage("Ошибка transformer-модели.")
             self._log(f"Ошибка быстрого анализа: {exc}")
             QMessageBox.critical(self, "Ошибка transformer-модели", str(exc))
@@ -1519,7 +2243,9 @@ class MainWindow(QMainWindow):
 
         self.quick_result_label.setText(f"{result.sentiment} · уверенность {result.confidence:.2f}")
         self._set_quick_result_sentiment(result.sentiment)
-        self.quick_probability_label.setText(format_probabilities(result.probabilities))
+        self.quick_probability_label.setText("Распределение вероятностей")
+        self.quick_confidence_bar.setValue(round(result.confidence * 100))
+        self._populate_quick_probability_table(result.probabilities)
         self._set_status("Готово", "ready")
         self.statusBar().showMessage("Быстрый анализ текста завершен.")
         self._log(f"Быстрый анализ: {result.sentiment}, уверенность {result.confidence:.2f}.")
@@ -1529,6 +2255,17 @@ class MainWindow(QMainWindow):
         self.quick_result_label.setText("Результат появится здесь")
         self._set_quick_result_sentiment(None)
         self.quick_probability_label.setText("Вероятности появятся после анализа")
+        self.quick_confidence_bar.setValue(0)
+        self.quick_probability_table.setRowCount(0)
+
+    def _populate_quick_probability_table(self, probabilities: dict[str, float]) -> None:
+        rows = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
+        self.quick_probability_table.setRowCount(len(rows))
+        for row, (label, score) in enumerate(rows):
+            label_item = QTableWidgetItem(label)
+            score_item = QTableWidgetItem(f"{score:.2f}")
+            self.quick_probability_table.setItem(row, 0, label_item)
+            self.quick_probability_table.setItem(row, 1, score_item)
 
     def _set_quick_result_sentiment(self, sentiment: str | None) -> None:
         state = {POSITIVE: "positive", NEUTRAL: "neutral", NEGATIVE: "negative"}.get(sentiment, "none")
@@ -1544,17 +2281,110 @@ class MainWindow(QMainWindow):
             lemmatize=self.lemmatize_check.isChecked(),
         )
 
+    def _analysis_device(self) -> str:
+        if hasattr(self, "train_device_combo"):
+            return self.train_device_combo.currentText()
+        return "Auto"
+
     def export_report(self) -> None:
         if not self.results:
             QMessageBox.information(self, "Нет результатов", "Сначала выполните анализ.")
             return
         default_name = f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        path, _ = QFileDialog.getSaveFileName(self, "Экспорт отчета", default_name, "HTML (*.html)")
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт отчёта", default_name, "HTML (*.html)")
         if not path:
             return
         report_path = export_html_report(path, self.results, self.model_combo.currentText())
-        self._log(f"HTML-отчет сохранен: {report_path}.")
-        self.statusBar().showMessage(f"Отчет сохранен: {report_path}")
+        self.current_report_path = report_path
+        self._load_report_preview(report_path)
+        self._log(f"HTML-отчёт сохранен: {report_path}.")
+        self.statusBar().showMessage(f"Отчёт сохранен: {report_path}")
+
+    def preview_report(self, silent: bool = False) -> None:
+        if not self.results:
+            if not silent:
+                QMessageBox.information(self, "Нет результатов", "Сначала выполните анализ.")
+            return
+        reports_dir = Path("reports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = export_html_report(
+            reports_dir / "preview_report.html",
+            self.results,
+            self.model_combo.currentText(),
+        )
+        self.current_report_path = report_path
+        self._load_report_preview(report_path)
+        if not silent:
+            self._log(f"Предпросмотр отчёта сформирован: {report_path}.")
+            self.statusBar().showMessage("Предпросмотр отчёта сформирован.")
+
+    def _load_report_preview(self, report_path: Path) -> None:
+        if not hasattr(self, "report_view"):
+            return
+        html = report_path.read_text(encoding="utf-8")
+        self.report_view.setSearchPaths([str(report_path.parent.resolve())])
+        self.report_view.setHtml(html)
+        if hasattr(self, "reports_stack"):
+            self.reports_stack.setCurrentIndex(1)
+
+    def open_report_in_browser(self) -> None:
+        if self.current_report_path is None or not self.current_report_path.exists():
+            QMessageBox.information(self, "Нет отчёта", "Сначала сформируйте предпросмотр или сохраните HTML-отчёт.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.current_report_path.resolve())))
+
+    def browse_custom_model(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Папка с обученной моделью",
+            str(Path.cwd()),
+        )
+        if not path:
+            return
+
+        folder = Path(path)
+        if not (folder / "config.json").exists():
+            QMessageBox.warning(
+                self,
+                "Не похоже на модель",
+                "В выбранной папке нет config.json. Ожидаются файлы формата Hugging Face "
+                "(config.json, model.safetensors или pytorch_model.bin, tokenizer_config.json, "
+                "special_tokens_map.json и т. п.).",
+            )
+            return
+
+        from app.models.sentiment import WEIGHT_FILES, TOKENIZER_VOCAB_FILES
+
+        weights_present = any((folder / name).exists() for name in WEIGHT_FILES)
+        if not weights_present:
+            QMessageBox.warning(
+                self,
+                "Не найдены веса",
+                "В папке есть config.json, но нет файлов весов "
+                "(model.safetensors или pytorch_model.bin). "
+                "Модель не загрузится без них.",
+            )
+            return
+
+        vocab_present = any((folder / name).exists() for name in TOKENIZER_VOCAB_FILES)
+        if not vocab_present:
+            QMessageBox.warning(
+                self,
+                "Нет словаря токенайзера",
+                "В папке нет файла словаря токенайзера: tokenizer.json (fast), "
+                "vocab.txt (BERT/DistilBERT), spiece.model / sentencepiece.bpe.model (XLM-R/T5) "
+                "или tokenizer.model. Без него токенайзер не сможет загрузиться — "
+                "скопируйте недостающий файл из папки базовой модели.",
+            )
+            return
+
+        path_str = str(folder)
+        if self.model_combo.findText(path_str) == -1:
+            self.model_combo.addItem(path_str)
+        self.model_combo.setCurrentText(path_str)
+        self.populate_profile_table()
+        self._log(f"Подключена локальная модель: {path_str}.")
+        self.statusBar().showMessage(f"Локальная модель выбрана: {folder.name}")
 
     def select_training_output_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Папка для сохранения модели", str(Path.cwd() / "models"))
@@ -1588,6 +2418,42 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Недостаточно классов", "Для обучения нужно минимум два класса после настройки меток.")
             return
 
+        val_prepared: LabelPrepareResult | None = None
+        if not self.val_data_frame.empty:
+            if text_column not in self.val_data_frame.columns or label_column not in self.val_data_frame.columns:
+                QMessageBox.warning(
+                    self,
+                    "Валидационная выборка несовместима",
+                    "В отдельном validation-файле нет тех же колонок текста и метки, что и в train.",
+                )
+                return
+            val_prepared = self._prepare_training_data(self.val_data_frame)
+            if val_prepared.used_rows == 0:
+                QMessageBox.warning(
+                    self,
+                    "Валидационная выборка пуста после фильтрации",
+                    "После применения настройки меток в validation-файле не осталось строк.",
+                )
+                return
+
+        test_prepared: LabelPrepareResult | None = None
+        if not self.test_data_frame.empty:
+            if text_column not in self.test_data_frame.columns or label_column not in self.test_data_frame.columns:
+                QMessageBox.warning(
+                    self,
+                    "Тестовая выборка несовместима",
+                    "В отдельном test-файле нет тех же колонок текста и метки, что и в train.",
+                )
+                return
+            test_prepared = self._prepare_training_data(self.test_data_frame)
+            if test_prepared.used_rows == 0:
+                QMessageBox.warning(
+                    self,
+                    "Тестовая выборка пуста после фильтрации",
+                    "После применения настройки меток в test-файле не осталось строк.",
+                )
+                return
+
         config = TrainConfig(
             model_name=self.train_base_model_combo.currentText(),
             output_dir=Path(self.train_output_edit.text()).resolve(),
@@ -1599,6 +2465,7 @@ class MainWindow(QMainWindow):
             learning_rate=self.train_lr_spin.value(),
             weight_decay=self.train_weight_decay_spin.value(),
             validation_split=self.train_val_split_spin.value(),
+            test_split=self.train_test_split_spin.value(),
             stratify_split=self.train_stratify_check.isChecked(),
             split_seed=self.train_split_seed_spin.value(),
             seed=self.train_seed_spin.value(),
@@ -1643,33 +2510,71 @@ class MainWindow(QMainWindow):
         )
 
         self.training_log.clear()
-        self.training_log.appendPlainText("Запуск обучения...")
-        self.training_log.appendPlainText(
-            f"После настройки меток: используется {prepared.used_rows} строк, исключено {prepared.excluded_rows}."
+        self.training_log_stack.setCurrentIndex(1)
+        self.training_metrics_chart.empty("Обучение выполняется")
+        self._append_training_log("Данные", "section")
+        self._append_training_log(
+            f"Train после меток: {format_int(prepared.used_rows)} строк; "
+            f"исключено {format_int(prepared.excluded_rows)}."
         )
-        self.training_log.appendPlainText(
-            "Классы: " + ", ".join(f"{label}: {count}" for label, count in prepared.class_counts.items())
+        self._append_training_log(
+            "Классы: "
+            + " · ".join(f"{label}: {format_int(count)}" for label, count in prepared.class_counts.items())
         )
+        self._append_split_plan_log(val_prepared, test_prepared, config)
+        if config.max_samples > 0:
+            self._append_training_log(
+                f"Лимит train: {format_int(config.max_samples)} строк после очистки/перемешивания."
+            )
+        if val_prepared is not None:
+            self._append_training_log(
+                f"Validation файл: {format_int(val_prepared.used_rows)} строк; "
+                f"исключено {format_int(val_prepared.excluded_rows)}."
+            )
+        if test_prepared is not None:
+            self._append_training_log(
+                f"Test файл: {format_int(test_prepared.used_rows)} строк; "
+                f"исключено {format_int(test_prepared.excluded_rows)}."
+            )
         self.training_progress.setRange(0, 0)
         self.train_button.setEnabled(False)
-        self._set_status("Обучение", "running")
-        self.statusBar().showMessage("Выполняется fine-tuning transformer-модели...")
+        self.cancel_train_button.setEnabled(True)
+        self._set_status("Обучение выполняется", "running")
+        self.statusBar().showMessage("Выполняется дообучение модели...")
 
-        self.training_thread = TrainingThread(prepared.texts, prepared.labels, config)
-        self.training_thread.message.connect(self.training_log.appendPlainText)
+        self.training_thread = TrainingThread(
+            prepared.texts,
+            prepared.labels,
+            config,
+            val_texts=val_prepared.texts if val_prepared is not None else None,
+            val_labels=val_prepared.labels if val_prepared is not None else None,
+            test_texts=test_prepared.texts if test_prepared is not None else None,
+            test_labels=test_prepared.labels if test_prepared is not None else None,
+        )
+        self.training_thread.message.connect(self.append_training_message)
         self.training_thread.completed.connect(self.on_training_completed)
         self.training_thread.failed.connect(self.on_training_failed)
+        self.training_thread.canceled.connect(self.on_training_canceled)
         self.training_thread.start()
 
     def on_training_completed(self, result: TrainResult) -> None:
         self.training_progress.setRange(0, 1)
         self.training_progress.setValue(1)
         self.train_button.setEnabled(True)
+        self.cancel_train_button.setEnabled(False)
         self._set_status("Готово", "ready")
-        self.training_log.appendPlainText(
-            f"Готово: accuracy={result.accuracy:.3f}, macro_f1={result.macro_f1:.3f}, "
-            f"train={result.train_size}, validation={result.validation_size}"
+        val_source = "файл" if result.validation_source == "external" else "split"
+        self.training_metrics_chart.draw_training_result(result)
+        self._append_training_log("Итог", "section")
+        self._append_training_log(
+            f"Validation ({val_source}): accuracy {result.accuracy:.3f} · macro F1 {result.macro_f1:.3f}"
         )
+        if result.test_size > 0:
+            test_source = "файл" if result.test_source == "external" else "split"
+            self._append_training_log(
+                f"Test ({test_source}, {format_int(result.test_size)} строк): "
+                f"accuracy {result.test_accuracy:.3f} · macro F1 {result.test_macro_f1:.3f}"
+            )
         output_path = str(result.output_dir)
         if self.model_combo.findText(output_path) == -1:
             self.model_combo.addItem(output_path)
@@ -1682,10 +2587,122 @@ class MainWindow(QMainWindow):
         self.training_progress.setRange(0, 1)
         self.training_progress.setValue(0)
         self.train_button.setEnabled(True)
-        self._set_status("Ошибка обучения", "error")
-        self.training_log.appendPlainText(message)
+        self.cancel_train_button.setEnabled(False)
+        self._set_status("Ошибка", "error")
+        self._append_training_log("Ошибка обучения", "section")
+        self._append_training_log(message)
         self.statusBar().showMessage("Ошибка обучения.")
         QMessageBox.critical(self, "Ошибка обучения", message)
+
+    def cancel_training(self) -> None:
+        if self.training_thread is None or not self.training_thread.isRunning():
+            return
+        self.training_thread.request_stop()
+        self.cancel_train_button.setEnabled(False)
+        self._set_status("Остановка", "running")
+        self._append_training_log("Остановка", "section")
+        self._append_training_log("Запрошено прерывание. Текущий batch будет завершён, затем обучение остановится.")
+        self.statusBar().showMessage("Остановка обучения...")
+
+    def on_training_canceled(self, message: str) -> None:
+        self.training_progress.setRange(0, 1)
+        self.training_progress.setValue(0)
+        self.train_button.setEnabled(True)
+        self.cancel_train_button.setEnabled(False)
+        self._set_status("Прервано", "ready")
+        self._append_training_log("Обучение прервано", "section")
+        self._append_training_log(message or "Остановлено пользователем.")
+        self.statusBar().showMessage("Обучение прервано пользователем.")
+
+    def append_training_message(self, message: str) -> None:
+        text = message.strip()
+        if not text:
+            return
+        if text.startswith("Фактическая выборка"):
+            self._append_training_log(text.replace("Фактическая выборка: ", "Размеры: "), "metric")
+            return
+        elif text.startswith("Источник модели"):
+            self._append_training_log(text.replace("Источник модели: ", "Источник: "))
+            return
+        if text.startswith("Загрузка базовой модели"):
+            self._append_training_log("Модель", "section")
+            self._append_training_log(text.replace("Загрузка базовой модели: ", "База: "))
+        elif text.startswith("Токенизация"):
+            self._append_training_log("Эпохи", "section")
+            self.training_log_stack.setCurrentIndex(1)
+            self.training_log.appendPlainText("  epoch   loss     acc    macro F1")
+        elif text.startswith("Эпоха"):
+            self._append_training_log(self._format_epoch_log(text), "metric")
+        elif text.startswith("Held-out"):
+            self._append_training_log("Test", "section")
+        elif text.startswith("Test:"):
+            self._append_training_log(self._format_test_log(text), "metric")
+        elif text.startswith("Модель сохранена"):
+            self._append_training_log("Сохранено", "section")
+            self._append_training_log(text.replace("Модель сохранена: ", "Папка: "))
+        else:
+            self._append_training_log(text)
+
+    def _append_training_log(self, text: str, kind: str = "info") -> None:
+        if hasattr(self, "training_log_stack"):
+            self.training_log_stack.setCurrentIndex(1)
+        if kind == "section":
+            if self.training_log.toPlainText():
+                self.training_log.appendPlainText("")
+            self.training_log.appendPlainText(text)
+            return
+        prefix = "  " if kind == "metric" else "  "
+        self.training_log.appendPlainText(f"{prefix}{text}")
+
+    @staticmethod
+    def _format_epoch_log(text: str) -> str:
+        match = re.search(
+            r"Эпоха\s+(\d+/\d+):\s+loss=([0-9.]+),\s+accuracy=([0-9.]+),\s+macro_f1=([0-9.]+)",
+            text,
+        )
+        if not match:
+            return text
+        epoch, loss, accuracy, macro_f1 = match.groups()
+        return f"{epoch:<7} {loss:<8} {accuracy:<6} {macro_f1}"
+
+    @staticmethod
+    def _format_test_log(text: str) -> str:
+        match = re.search(r"accuracy=([0-9.]+),\s+macro_f1=([0-9.]+)", text)
+        if not match:
+            return text
+        accuracy, macro_f1 = match.groups()
+        return f"accuracy {accuracy} · macro F1 {macro_f1}"
+
+    def _append_split_plan_log(
+        self,
+        val_prepared: LabelPrepareResult | None,
+        test_prepared: LabelPrepareResult | None,
+        config: TrainConfig,
+    ) -> None:
+        has_val_file = val_prepared is not None
+        has_test_file = test_prepared is not None
+        if has_val_file and has_test_file:
+            self._append_training_log("Разбиение: train не делится; validation и test из файлов.")
+        elif has_val_file:
+            if config.test_split > 0:
+                self._append_training_log(
+                    f"Разбиение: validation из файла; test {config.test_split:.0%} из train."
+                )
+            else:
+                self._append_training_log("Разбиение: validation из файла; test не используется.")
+        elif has_test_file:
+            self._append_training_log(
+                f"Разбиение: test из файла; validation {config.validation_split:.0%} из train."
+            )
+        elif config.test_split > 0:
+            self._append_training_log(
+                f"Разбиение: test {config.test_split:.0%} из train; "
+                f"validation {config.validation_split:.0%} из оставшейся части."
+            )
+        else:
+            self._append_training_log(
+                f"Разбиение: validation {config.validation_split:.0%} из train; test не используется."
+            )
 
     def _label_action_values(self) -> list[str]:
         if self.target_scheme_combo.currentText() == SENTIMENT_SCHEME:
@@ -1716,9 +2733,12 @@ class MainWindow(QMainWindow):
             return
 
         parse_as_list = self.label_format_combo.currentText() == "Список меток в строке"
-        for value in self.data_frame[label_column].tolist():
-            for token in parse_label_tokens(value, parse_as_list=parse_as_list):
-                self.label_count_by_token[token] += 1
+        for frame in (self.data_frame, self.val_data_frame, self.test_data_frame):
+            if frame.empty or label_column not in frame.columns:
+                continue
+            for value in frame[label_column].tolist():
+                for token in parse_label_tokens(value, parse_as_list=parse_as_list):
+                    self.label_count_by_token[token] += 1
 
         rows = sorted(self.label_count_by_token.items(), key=lambda item: (-item[1], label_key(item[0])))
         header = "Sentiment" if self.target_scheme_combo.currentText() == SENTIMENT_SCHEME else "Действие"
@@ -1730,11 +2750,11 @@ class MainWindow(QMainWindow):
 
             action = self._default_label_action(raw_label)
             combo = make_combo(self._label_action_values(), action)
-            combo.setObjectName("tableCombo")
             combo.currentTextChanged.connect(self.update_label_mapping_summary)
+
             self.label_action_combos[raw_label] = combo
             self.label_mapping_table.setCellWidget(row, 2, combo)
-            self.label_mapping_table.setRowHeight(row, 40)
+            self.label_mapping_table.setRowHeight(row, 44)
 
         self.update_label_mapping_summary()
 
@@ -1771,7 +2791,11 @@ class MainWindow(QMainWindow):
             return action
         return None
 
-    def _prepare_training_data(self) -> LabelPrepareResult:
+    def _prepare_training_data(
+        self,
+        frame: pd.DataFrame | None = None,
+    ) -> LabelPrepareResult:
+        source = self.data_frame if frame is None else frame
         text_column = self.train_text_column_combo.currentText()
         label_column = self.train_label_column_combo.currentText()
         parse_as_list = self.label_format_combo.currentText() == "Список меток в строке"
@@ -1781,7 +2805,10 @@ class MainWindow(QMainWindow):
         labels: list[str] = []
         excluded = 0
 
-        for _, row in self.data_frame.iterrows():
+        if source is None or source.empty or text_column not in source.columns or label_column not in source.columns:
+            return LabelPrepareResult(texts=[], labels=[], used_rows=0, excluded_rows=0, class_counts=Counter())
+
+        for _, row in source.iterrows():
             text = str(row.get(text_column, "")).strip()
             tokens = parse_label_tokens(row.get(label_column, ""), parse_as_list=parse_as_list)
             target = self._map_tokens_to_target(tokens, mapping)
@@ -1805,14 +2832,28 @@ class MainWindow(QMainWindow):
         list_note = ""
         if self.label_format_combo.currentText() == "Список меток в строке":
             list_note = " Режим обучения сейчас single-label: из списка меток для каждой строки выбирается одна целевая метка."
+
+        extras: list[str] = []
+        if not self.val_data_frame.empty:
+            val_prepared = self._prepare_training_data(self.val_data_frame)
+            extras.append(
+                f"Validation (файл): {format_int(val_prepared.used_rows)} строк, исключено {format_int(val_prepared.excluded_rows)}"
+            )
+        if not self.test_data_frame.empty:
+            test_prepared = self._prepare_training_data(self.test_data_frame)
+            extras.append(
+                f"Test (файл): {format_int(test_prepared.used_rows)} строк, исключено {format_int(test_prepared.excluded_rows)}"
+            )
+        extras_text = (" " + " · ".join(extras) + ".") if extras else ""
+
         self.label_mapping_summary.setText(
-            f"После настройки меток будет использовано {format_int(prepared.used_rows)} строк, "
-            f"исключено {format_int(prepared.excluded_rows)} строк. Классы: {counts}.{list_note}"
+            f"Train после настройки меток: использовано {format_int(prepared.used_rows)} строк, "
+            f"исключено {format_int(prepared.excluded_rows)} строк. Классы: {counts}.{list_note}{extras_text}"
         )
 
     def refresh_analysis(self) -> None:
         summary = summarize_results(self.results)
-        total = len(self.data_frame)
+        total = len(self.analysis_data_frame)
         processed = int(summary["processed"])
         low_confidence = sum(result.confidence < 0.60 for result in self.results)
         self.total_card.set_values(format_int(total), "в наборе данных")
@@ -1823,6 +2864,9 @@ class MainWindow(QMainWindow):
         self.class_chart.draw_class_distribution(class_distribution(self.results))
         self.confidence_chart.draw_confidence_histogram(self.results)
         self.refresh_monitoring()
+        self._refresh_workflow_state()
+        if self.results and hasattr(self, "report_view"):
+            self.preview_report(silent=True)
 
     def refresh_monitoring(self) -> None:
         report = build_drift_report(self.results)
@@ -1843,13 +2887,13 @@ class MainWindow(QMainWindow):
             self.monitoring_table.setItem(row, 1, QTableWidgetItem(value))
 
     def populate_preview_table(self) -> None:
-        total = len(self.data_frame)
+        source_frame = self._current_preview_frame()
+        total = len(source_frame)
         page_size = self.preview_page_size_spin.value() if hasattr(self, "preview_page_size_spin") else 200
         if total == 0:
             self.preview_offset = 0
             self.preview_table.setRowCount(0)
             self.preview_table.setColumnCount(0)
-            self.dataset_preview_card.set_values("0", "строк в предпросмотре")
             if hasattr(self, "preview_range_label"):
                 self.preview_range_label.setText("Строки 0-0 из 0")
                 self.preview_jump_spin.setRange(1, 1)
@@ -1858,7 +2902,7 @@ class MainWindow(QMainWindow):
             return
 
         self.preview_offset = max(0, min(self.preview_offset, max(total - 1, 0)))
-        frame = self.data_frame.iloc[self.preview_offset : self.preview_offset + page_size]
+        frame = source_frame.iloc[self.preview_offset : self.preview_offset + page_size]
         self.preview_table.setRowCount(len(frame))
         self.preview_table.setColumnCount(len(frame.columns))
         self.preview_table.setHorizontalHeaderLabels([str(column) for column in frame.columns])
@@ -1873,7 +2917,6 @@ class MainWindow(QMainWindow):
                 self.preview_table.setItem(row_index, column_index, QTableWidgetItem(str(value)[:300]))
         start = self.preview_offset + 1
         end = self.preview_offset + len(frame)
-        self.dataset_preview_card.set_values(format_int(len(frame)), f"строки {format_int(start)}-{format_int(end)}")
         if hasattr(self, "preview_range_label"):
             self.preview_range_label.setText(f"Строки {format_int(start)}-{format_int(end)} из {format_int(total)}")
             self.preview_jump_spin.blockSignals(True)
@@ -1889,7 +2932,7 @@ class MainWindow(QMainWindow):
         self.populate_preview_table()
 
     def _jump_preview_page(self) -> None:
-        if self.data_frame.empty:
+        if self._current_preview_frame().empty:
             return
         self.preview_offset = self.preview_jump_spin.value() - 1
         self.populate_preview_table()
@@ -1904,19 +2947,24 @@ class MainWindow(QMainWindow):
         self.populate_preview_table()
 
     def _preview_next_page(self) -> None:
-        if self.data_frame.empty:
+        source = self._current_preview_frame()
+        if source.empty:
             return
         page_size = self.preview_page_size_spin.value()
-        self.preview_offset = min(max(len(self.data_frame) - 1, 0), self.preview_offset + page_size)
+        self.preview_offset = min(max(len(source) - 1, 0), self.preview_offset + page_size)
         self.populate_preview_table()
 
     def populate_results_table(self, results: list[AnalysisResult]) -> None:
         visible_results = results[:1000]
         self.result_count_label.setText(f"Всего: {format_int(len(results))}")
         score_labels = result_score_labels(visible_results)
-        headers = ["#", "Текст", "Класс", "Увер.", *score_labels, "Источник"]
+        headers = ["#", "Текст", "Класс", "Увер.", *[compact_score_label(label) for label in score_labels]]
         self.results_table.setColumnCount(len(headers))
         self.results_table.setHorizontalHeaderLabels(headers)
+        for offset, label in enumerate(score_labels, start=4):
+            header_item = self.results_table.horizontalHeaderItem(offset)
+            if header_item is not None:
+                header_item.setToolTip(label)
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         if len(headers) > 1:
@@ -1925,8 +2973,7 @@ class MainWindow(QMainWindow):
         self.results_table.setColumnWidth(2, 128)
         self.results_table.setColumnWidth(3, 80)
         for column in range(4, 4 + len(score_labels)):
-            self.results_table.setColumnWidth(column, 96)
-        self.results_table.setColumnWidth(len(headers) - 1, 120)
+            self.results_table.setColumnWidth(column, 76)
         self.results_table.setRowCount(len(visible_results))
         for row, result in enumerate(visible_results):
             values = [
@@ -1935,7 +2982,6 @@ class MainWindow(QMainWindow):
                 result.sentiment,
                 f"{result.confidence:.2f}",
                 *[f"{result.probabilities.get(label, 0.0):.2f}" for label in score_labels],
-                result.source,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1947,22 +2993,96 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "profile_table"):
             return
         rows = comparison_rows()
+        known = {self._model_identity(str(profile["name"])) for profile in rows}
+        for model_path in self._existing_local_models():
+            identity = self._model_identity(model_path)
+            if identity not in known:
+                rows.append(self._local_model_profile(model_path))
+                known.add(identity)
+        if hasattr(self, "model_combo"):
+            for index in range(self.model_combo.count()):
+                model_name = self.model_combo.itemText(index)
+                identity = self._model_identity(model_name)
+                if identity not in known and Path(model_name).exists():
+                    rows.append(self._local_model_profile(model_name))
+                    known.add(identity)
+
         self.profile_table.setRowCount(len(rows))
         for row, profile in enumerate(rows):
             name = str(profile["name"])
             values = [
                 name,
-                self._model_status(name),
-                f"{float(profile['accuracy']):.2f}",
-                f"{float(profile['macro_f1']):.2f}",
-                f"{float(profile['confidence']):.2f}",
-                f"{profile['speed']} стр/с",
+                str(profile.get("status") or self._model_status(name)),
+                self._format_profile_metric(profile.get("accuracy")),
+                self._format_profile_metric(profile.get("macro_f1")),
+                self._format_profile_metric(profile.get("confidence")),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if name == self.model_combo.currentText():
+                if hasattr(self, "model_combo") and name == self.model_combo.currentText():
                     item.setBackground(QColor("#d7e5fb"))
                 self.profile_table.setItem(row, column, item)
+
+    @staticmethod
+    def _format_profile_metric(value: object) -> str:
+        if value in (None, "", "—"):
+            return "—"
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _model_identity(model_name: str) -> str:
+        path = Path(model_name)
+        if path.exists():
+            return str(path.resolve()).casefold()
+        return model_name.casefold()
+
+    def _existing_local_models(self) -> list[str]:
+        models_dir = Path("models")
+        if not models_dir.exists():
+            return []
+        paths: dict[str, str] = {}
+        for config_path in models_dir.rglob("config.json"):
+            folder = config_path.parent
+            if not folder.is_dir():
+                continue
+            if not self._looks_like_local_model(folder):
+                continue
+            resolved = str(folder.resolve())
+            paths[resolved.casefold()] = resolved
+        return sorted(paths.values(), key=lambda value: Path(value).name.casefold())
+
+    def _inference_local_models(self) -> list[str]:
+        return [model_path for model_path in self._existing_local_models() if self._is_trained_inference_model(Path(model_path))]
+
+    @staticmethod
+    def _looks_like_local_model(folder: Path) -> bool:
+        has_weights = any((folder / name).exists() for name in WEIGHT_FILES)
+        has_tokenizer = any((folder / name).exists() for name in TOKENIZER_VOCAB_FILES)
+        return has_weights and has_tokenizer
+
+    @staticmethod
+    def _is_trained_inference_model(folder: Path) -> bool:
+        return (folder / "training_metrics.json").exists()
+
+    def _local_model_profile(self, model_path: str) -> dict[str, float | int | str]:
+        path = Path(model_path)
+        metrics_path = path / "training_metrics.json"
+        metrics: dict[str, object] = {}
+        if metrics_path.exists():
+            try:
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                metrics = {}
+        return {
+            "name": str(path.resolve()) if path.exists() else model_path,
+            "status": "локальная обученная" if metrics else self._model_status(model_path),
+            "accuracy": metrics.get("accuracy", "—"),
+            "macro_f1": metrics.get("macro_f1", "—"),
+            "confidence": "—",
+        }
 
     def apply_filter(self, text: str) -> None:
         if not text:
@@ -1972,14 +3092,18 @@ class MainWindow(QMainWindow):
         filtered = [
             result
             for result in self.results
-            if query in result.text.casefold() or query in result.sentiment.casefold() or query in result.source.casefold()
+            if query in result.text.casefold() or query in result.sentiment.casefold()
         ]
         self.populate_results_table(filtered)
 
     def _select_model_from_profile(self, row: int, column: int) -> None:
         if self.profile_table.item(row, 0) is not None:
-            self.model_combo.setCurrentText(self.profile_table.item(row, 0).text())
-            self.statusBar().showMessage("Модель выбрана из профиля.")
+            model_name = self.profile_table.item(row, 0).text()
+            if not self._is_trained_inference_model(Path(model_name)):
+                self.statusBar().showMessage("Это базовая модель для обучения, не готовая модель анализа.")
+                return
+            self.model_combo.setCurrentText(model_name)
+            self.statusBar().showMessage("Модель анализа выбрана из профиля.")
 
     def _read_dataset(self, path: Path) -> pd.DataFrame:
         suffix = path.suffix.lower()
@@ -2012,16 +3136,16 @@ class MainWindow(QMainWindow):
                 last_error = exc
         raise ValueError(f"Не удалось прочитать TXT: {last_error}") from last_error
 
-    def _populate_column_combo(self) -> None:
+    def _populate_analysis_columns(self) -> None:
         self.text_column_combo.clear()
-        columns = [str(column) for column in self.data_frame.columns]
+        columns = [str(column) for column in self.analysis_data_frame.columns]
         preferred = next(
             (column for column in columns if column.lower() in {"text", "текст", "review", "content", "message"}),
             columns[0] if columns else "text",
         )
         self.text_column_combo.addItems(columns)
         self.text_column_combo.setCurrentText(preferred)
-        self._log(f"Колонка текста: {preferred}.")
+        self._log(f"Колонка текста для анализа: {preferred}.")
 
     def _populate_training_columns(self) -> None:
         columns = [str(column) for column in self.data_frame.columns]
@@ -2042,19 +3166,23 @@ class MainWindow(QMainWindow):
             self.train_label_column_combo.setCurrentText(label_preferred)
         self.train_label_column_combo.blockSignals(False)
 
-    def _guess_source_column(self) -> str | None:
-        for column in self.data_frame.columns:
+    def _guess_source_column(self, frame: pd.DataFrame | None = None) -> str | None:
+        source = self.analysis_data_frame if frame is None else frame
+        for column in source.columns:
             if str(column).lower() in {"source", "источник", "platform", "site"}:
                 return str(column)
         return None
 
     @staticmethod
     def _model_status(name: str) -> str:
-        if Path(name).exists():
-            return "локальная"
+        path = Path(name)
+        if path.exists():
+            if (path / "training_metrics.json").exists():
+                return "локальная обученная"
+            return "базовая для обучения"
         if name.startswith("models/"):
             return "не найдена"
-        return "профиль HF"
+        return "Профиль Hugging Face"
 
     def _refresh_empty_charts(self) -> None:
         self.class_chart.empty()
@@ -2087,6 +3215,11 @@ class MainWindow(QMainWindow):
                 background: #f8fafc;
                 border-bottom: 1px solid rgba(129, 145, 166, 0.35);
                 border-radius: 0;
+            }
+            #contextSeparator {
+                color: rgba(129, 145, 166, 0.5);
+                font-size: 13px;
+                padding: 0 2px;
             }
             #contextTitle {
                 color: #7b8798;
@@ -2201,17 +3334,44 @@ class MainWindow(QMainWindow):
                 padding: 8px;
                 font-weight: 400;
             }
+            #analysisSettingsSection {
+                background: #fbfcfe;
+                border: 1px solid rgba(129, 145, 166, 0.24);
+                border-radius: 4px;
+            }
+            QFrame#softSeparator {
+                background: rgba(129, 145, 166, 0.22);
+                border: 0;
+            }
             #quickResultPanel {
                 background: #fbfcfe;
-                border-left: 1px solid rgba(129, 145, 166, 0.38);
-                border-radius: 0;
+                border: 1px solid rgba(129, 145, 166, 0.38);
+                border-radius: 4px;
             }
             QPlainTextEdit#quickTextInput {
                 min-height: 240px;
             }
+            QTableWidget#quickProbabilityTable {
+                background: #ffffff;
+                alternate-background-color: #f7f9fc;
+                gridline-color: #e5eaf1;
+                border: 1px solid rgba(129, 145, 166, 0.32);
+                border-radius: 4px;
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+            }
+            QTableWidget#quickProbabilityTable::item {
+                padding: 4px;
+            }
+            QTextBrowser#reportPreview {
+                border: 1px solid rgba(129, 145, 166, 0.38);
+                border-radius: 4px;
+                background: #ffffff;
+                padding: 12px;
+            }
             #quickResult {
                 color: #111827;
-                font-size: 13px;
+                font-size: 16px;
                 font-weight: 400;
             }
             #quickResult[sentiment="positive"] { color: #2563eb; }
@@ -2245,6 +3405,20 @@ class MainWindow(QMainWindow):
                 font-weight: 400;
             }
             QPushButton#primaryButton:hover { background: #1f65b8; }
+            QPushButton#dangerButton {
+                background: #fff1f1;
+                border-color: rgba(220, 38, 38, 0.42);
+                color: #991b1b;
+            }
+            QPushButton#dangerButton:hover {
+                background: #fee2e2;
+                border-color: rgba(220, 38, 38, 0.62);
+            }
+            QPushButton#dangerButton:disabled {
+                color: #9ca3af;
+                background: #f1f4f8;
+                border-color: rgba(107, 120, 140, 0.28);
+            }
             QPushButton#modeButton {
                 min-height: 28px;
                 padding: 4px 12px;
@@ -2284,10 +3458,10 @@ class MainWindow(QMainWindow):
                 padding: 4px 8px;
             }
             QComboBox#tableCombo {
-                min-height: 28px;
-                max-height: 28px;
-                margin: 4px;
-                padding: 4px 8px;
+                min-height: 32px;
+                max-height: 32px;
+                margin: 0px;
+                padding: 0px 8px;
             }
             QComboBox:hover, QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
                 border-color: #6e9bd6;
@@ -2299,6 +3473,26 @@ class MainWindow(QMainWindow):
                 color: #172033;
                 padding: 8px;
                 selection-background-color: #dbeafe;
+            }
+            QPlainTextEdit#trainingLog {
+                border: 0;
+                border-radius: 0;
+                font-family: Consolas, "Cascadia Mono", monospace;
+                font-size: 12px;
+                line-height: 1.35;
+            }
+            QStackedWidget#trainingLogStack {
+                border: 1px solid rgba(129, 145, 166, 0.38);
+                border-radius: 4px;
+                background: #fbfcfe;
+            }
+            QFrame#trainingLogEmpty {
+                background: #fbfcfe;
+                border: 0;
+            }
+            QLabel#emptyLogMessage {
+                color: #6b7280;
+                font-size: 14px;
             }
             QCheckBox {
                 spacing: 8px;
@@ -2322,7 +3516,7 @@ class MainWindow(QMainWindow):
                 color: #526070;
                 border: 0;
                 border-bottom: 1px solid rgba(129, 145, 166, 0.32);
-                padding: 8px;
+                padding: 6px;
                 font-weight: 400;
                 font-size: 11px;
             }
@@ -2376,24 +3570,62 @@ class MainWindow(QMainWindow):
                 border: 0;
             }
             QLabel#statusChip {
-                border-radius: 4px;
-                padding: 8px;
+                min-height: 28px;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 12px;
                 font-weight: 400;
             }
             QLabel#statusChip[state="ready"] {
-                background: #eef9ee;
-                border: 1px solid rgba(34, 126, 62, 0.35);
+                background: #f0f8f2;
+                border: 1px solid rgba(34, 126, 62, 0.30);
                 color: #166534;
             }
             QLabel#statusChip[state="running"] {
                 background: #eef5ff;
-                border: 1px solid rgba(37, 111, 199, 0.35);
+                border: 1px solid rgba(37, 111, 199, 0.30);
                 color: #1f5fa9;
             }
             QLabel#statusChip[state="error"] {
-                background: #fef2f2;
-                border: 1px solid rgba(220, 38, 38, 0.34);
+                background: #fff1f1;
+                border: 1px solid rgba(220, 38, 38, 0.30);
                 color: #991b1b;
+            }
+            QStatusBar[state="ready"] {
+                color: #166534;
+            }
+            QStatusBar[state="running"] {
+                color: #1f5fa9;
+            }
+            QStatusBar[state="error"] {
+                color: #991b1b;
+            }
+            QLabel#sidebarHint {
+                color: #7b8798;
+                font-size: 11px;
+                padding: 8px 4px;
+                line-height: 1.4;
+            }
+            #emptyStateKicker {
+                color: #256fc7;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.8px;
+            }
+            #emptyStateTitle {
+                color: #111827;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            #emptyStateMessage {
+                color: #526070;
+                font-size: 12px;
+                line-height: 1.5;
+            }
+            #emptyStateStepText {
+                color: #5b677a;
+                font-size: 12px;
+                line-height: 1.5;
             }
             """
         )

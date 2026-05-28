@@ -130,7 +130,7 @@
 
 ### Context Bar
 - Role: Dataset context only, not a duplicate of analysis or training tabs.
-- Contains: dataset loading, active file, row count, and inference device.
+- Contains: active file, row count, and a compact status indicator.
 - Does not contain a status chip, analysis text column selector, or analysis model selector.
 - Analysis text column and analysis model live inside the `Анализ` page.
 - Training model, training dataset mapping, and training device stay inside the `Обучение` page.
@@ -153,13 +153,16 @@
 
 ### Model Profiles Table
 - Show only real inference profiles, not placeholder local paths for models that are not present.
-- Headers are compact and readable: `Модель`, `Статус`, `Accuracy`, `Macro F1`, `Уверенность`, `Скорость`.
+- Include trained local models when their folder contains `config.json`; read `training_metrics.json` for actual validation metrics when available.
+- Base checkpoints cached for training may be shown as `базовая для обучения`, but they are not added to the analysis model selector.
+- Headers are compact and readable: `Модель`, `Статус`, `Accuracy`, `Macro F1`, `Уверенность`.
 - Metric columns use fixed widths; model column stretches.
 
 ### Analysis Page
 - Right column is reserved for charts and evidence, not an event log.
 - Runtime events are kept in memory and surfaced through the status bar.
 - Analysis settings use compact horizontal rows, not a stretched grid with large empty gaps.
+- Batch analysis uses its own loaded analysis file; it must not reuse the training dataset implicitly.
 - Model selector may stretch; preprocessing checkboxes stay grouped tightly before the primary action.
 - Result table probability columns are dynamic and come from actual model labels, not fixed `Positive/Neutral/Negative`.
 - Quick text analysis shows whatever probability labels the loaded model returns.
@@ -168,6 +171,12 @@
 - Preview is paginated, not a static first-200-rows table.
 - Controls include current range, page size, jump-to-row, first page, previous page, and next page.
 - Preview metric shows the current page size and row range.
+
+### Reports
+- Use `QTextBrowser` for lightweight in-app HTML preview.
+- Keep `Открыть в браузере` for full browser rendering without adding PyQt6-WebEngine.
+- Report preview is generated from the same self-contained HTML used for export.
+- Include lightweight HTML/CSS charts in the report: class distribution, confidence histogram, and low-confidence examples.
 
 ### Quick Text Analysis
 - Input area is the primary surface and should be tall enough for paragraph text.

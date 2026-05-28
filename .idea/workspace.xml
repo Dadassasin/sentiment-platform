@@ -5,7 +5,10 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="92e03be6-dd50-4db2-9c2c-733d076f4a01" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.interface-design/system.md" beforeDir="false" afterPath="$PROJECT_DIR$/.interface-design/system.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/reports/html_report.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/reports/html_report.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/training/transformer_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/training/transformer_trainer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/ui/main_window.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -14,6 +17,9 @@
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="MarkdownSettingsMigration">
+    <option name="stateVersion" value="1" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 6
@@ -71,6 +77,7 @@
       <workItem from="1779566703327" duration="2455000" />
       <workItem from="1779889503287" duration="953000" />
       <workItem from="1779890679660" duration="95000" />
+      <workItem from="1779936137568" duration="9000" />
     </task>
     <servers />
   </component>
