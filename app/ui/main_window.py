@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import shutil
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,7 +24,7 @@ from pathlib import Path
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QEvent, QThread, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -48,6 +50,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStatusBar,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -60,10 +63,12 @@ from app.models.sentiment import (
     MODEL_PROFILES,
     TRAINING_BASE_MODELS,
     TOKENIZER_VOCAB_FILES,
+    inspect_model_schema,
     SentimentAnalyzer,
     TransformerLoadError,
     WEIGHT_FILES,
 )
+from app.models.comparison import compare_models
 from app.monitoring import build_drift_report
 from app.preprocessing import PreprocessingOptions
 from app.reports import export_html_report
@@ -108,7 +113,7 @@ TRAINING_FIELD_HELP = {
     "Максимум строк": "Ограничивает размер обучающего набора для быстрых пробных запусков; 0 значит без ограничения.",
     "Очистка": "Удаляет дубли и перемешивает строки перед разбиением на train/validation.",
     "Validation split": "Доля данных, отложенная для проверки качества после каждой эпохи.",
-    "Test split": "Доля данных, отложенная для независимой оценки после обучения. Применяется только если отдельная тестовая выборка не загружена. 0 — не использовать тестовую выборку.",
+    "Test split": "Доля данных, отложенная для независимой оценки после обучения. Применяется только если отдельная тестовая выборка не загружена. 0 - не использовать тестовую выборку.",
     "Split seed": "Отдельный seed для разбиения данных на train и validation.",
     "Стратегия": "Стратификация сохраняет похожее распределение классов в train и validation.",
     "Веса классов": "Balanced повышает вклад редких классов, если данные несбалансированы.",
@@ -276,6 +281,34 @@ class TrainingTabWidget(QWidget):
         return self.stack.count()
 
 
+class CenterStatusBar(QStatusBar):
+    def __init__(self) -> None:
+        super().__init__()
+        self._message_label = QLabel("")
+        self._message_label.setObjectName("statusMessageLabel")
+        self._message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._message_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.clearMessage)
+        self.addWidget(self._message_label, 1)
+
+    def showMessage(self, message: str, timeout: int = 0) -> None:
+        self._timer.stop()
+        self._message_label.setText(message)
+        self.messageChanged.emit(message)
+        if timeout > 0:
+            self._timer.start(timeout)
+
+    def clearMessage(self) -> None:
+        self._timer.stop()
+        self._message_label.clear()
+        self.messageChanged.emit("")
+
+    def currentMessage(self) -> str:
+        return self._message_label.text()
+
+
 def format_int(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
@@ -374,16 +407,21 @@ def auto_target_for_label(raw_label: str) -> str:
     return KEEP_ORIGINAL
 
 
-def make_combo(values: list[str], current: str) -> QComboBox:
+def make_combo(values: list[str], current: str, *, editable: bool = False) -> QComboBox:
     combo = QComboBox()
     combo.addItems(values)
+    combo.setEditable(editable)
+    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
     if current in values:
         combo.setCurrentText(current)
+    elif editable and current:
+        combo.setEditText(current)
 
     combo.setObjectName("tableCombo")
     combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     combo.setFixedHeight(32)
     combo.setMinimumWidth(0)
+    combo.setMinimumContentsLength(18 if editable else 0)
 
     return combo
 
@@ -537,6 +575,56 @@ class ChartWidget(Panel):
             ax.spines[spine].set_visible(False)
         self.canvas.draw_idle()
 
+    def draw_grouped_bars(
+        self,
+        categories: list[str],
+        series: list[tuple[str, list[float], str]],
+        *,
+        y_max: float | None = None,
+        rotate_labels: int = 0,
+    ) -> None:
+        if not categories or not series:
+            self.empty()
+            return
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        positions = list(range(len(categories)))
+        series_count = len(series)
+        width = 0.8 / max(series_count, 1)
+        offset_base = (series_count - 1) / 2
+        for index, (label, values, color) in enumerate(series):
+            offset = (index - offset_base) * width
+            ax.bar([position + offset for position in positions], values, width, label=label, color=color)
+        if y_max is not None:
+            ax.set_ylim(0, y_max)
+        ax.set_xticks(positions, categories, rotation=rotate_labels, ha="right" if rotate_labels else "center")
+        ax.grid(axis="y", color="#e5e7eb", linewidth=0.8)
+        ax.legend(fontsize=8, frameon=False, loc="upper right")
+        ax.tick_params(labelsize=8)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        self.canvas.draw_idle()
+
+    def draw_heatmap(self, labels: list[str], matrix: list[list[float]]) -> None:
+        if not labels or not matrix:
+            self.empty()
+            return
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        image = ax.imshow(matrix, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+        ax.set_xticks(range(len(labels)), labels, rotation=25, ha="right")
+        ax.set_yticks(range(len(labels)), labels)
+        ax.tick_params(labelsize=8)
+        for row_index, row in enumerate(matrix):
+            for column_index, value in enumerate(row):
+                text_color = "#ffffff" if value >= 0.55 else "#1f2937"
+                ax.text(column_index, row_index, f"{value:.0%}", ha="center", va="center", fontsize=7, color=text_color)
+        color_bar = self.figure.colorbar(image, ax=ax, fraction=0.04, pad=0.03)
+        color_bar.ax.tick_params(labelsize=8)
+        self.canvas.draw_idle()
+
 
 class TrainingThread(QThread):
     message = pyqtSignal(str)
@@ -614,18 +702,28 @@ class MainWindow(QMainWindow):
         self.preview_source = "train"
         self.current_report_path: Path | None = None
         self.results: list[AnalysisResult] = []
+        self.comparison_behavior_rows: list[object] = []
+        self.comparison_quality_rows: list[object] = []
         self.event_log: list[tuple[str, str]] = []
         self.preview_offset = 0
         self.nav_buttons: list[QPushButton] = []
         self.training_thread: TrainingThread | None = None
         self.label_action_combos: dict[str, QComboBox] = {}
+        self.label_target_edits: dict[str, QLineEdit] = {}
         self.label_count_by_token: Counter[str] = Counter()
+        self._fill_width_tables: dict[int, QTableWidget] = {}
+        self._fill_width_viewports: dict[int, QTableWidget] = {}
+        self._table_resize_guard: set[int] = set()
+        self._populating_profile_table = False
+        self._pending_profile_rename_path: str | None = None
+        self._pending_profile_rename_original_name: str = ""
 
         self._build_ui()
         self._apply_styles()
         self._set_initial_state()
 
     def _build_ui(self) -> None:
+        self.setStatusBar(CenterStatusBar())
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -637,6 +735,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._build_analysis_page())
         self.pages.addWidget(self._build_training_page())
         self.pages.addWidget(self._build_models_page())
+        self.pages.addWidget(self._build_comparison_page())
         self.pages.addWidget(self._build_monitoring_page())
         self.pages.addWidget(self._build_reports_page())
 
@@ -672,15 +771,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._context_separator())
         self.context_train_label = self._add_context_field(layout, "Train:", "0")
         layout.addWidget(self._context_separator())
-        self.context_val_label = self._add_context_field(layout, "Val:", "—")
+        self.context_val_label = self._add_context_field(layout, "Val:", "-")
         layout.addWidget(self._context_separator())
-        self.context_test_label = self._add_context_field(layout, "Test:", "—")
+        self.context_test_label = self._add_context_field(layout, "Test:", "-")
         layout.addWidget(self._context_separator())
         self.context_model_label = self._add_context_field(
-            layout, "Модель:", "—", min_width=140
+            layout, "Модель:", "-", min_width=140
         )
         layout.addWidget(self._context_separator())
-        self.context_device_label = self._add_context_field(layout, "Устройство:", "—")
+        self.context_device_label = self._add_context_field(layout, "Устройство:", "-")
         layout.addWidget(self._context_separator())
 
         self.status_label = QLabel("● Готово")
@@ -731,7 +830,7 @@ class MainWindow(QMainWindow):
         nav_title = QLabel("НАВИГАЦИЯ")
         nav_title.setObjectName("sidebarSection")
         layout.addWidget(nav_title)
-        nav = ["Данные", "Анализ", "Обучение", "Модели", "Мониторинг", "Отчёты"]
+        nav = ["Данные", "Анализ", "Обучение", "Модели", "Сравнение", "Мониторинг", "Отчёты"]
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for index, title in enumerate(nav):
@@ -811,8 +910,8 @@ class MainWindow(QMainWindow):
         data_metrics.setHorizontalSpacing(SPACE_3)
         data_metrics.setVerticalSpacing(SPACE_3)
         self.train_rows_card = MetricCard("Train", "0", "строк")
-        self.val_rows_card = MetricCard("Validation", "—", "не загружен")
-        self.test_rows_card = MetricCard("Test", "—", "не загружен")
+        self.val_rows_card = MetricCard("Validation", "-", "не загружен")
+        self.test_rows_card = MetricCard("Test", "-", "не загружен")
         self.dataset_columns_card = MetricCard("Колонки train", "0", "доступно для выбора")
         for column, card in enumerate((
             self.train_rows_card,
@@ -878,6 +977,7 @@ class MainWindow(QMainWindow):
 
         self.preview_table = QTableWidget(0, 0)
         self._configure_embedded_table(self.preview_table)
+        self._enable_fill_width_columns(self.preview_table)
         preview.layout.addWidget(self.preview_table)
         page.layout().addWidget(preview, 1)
         return page
@@ -1064,10 +1164,10 @@ class MainWindow(QMainWindow):
         self._configure_embedded_table(self.quick_probability_table)
         self.quick_probability_table.setObjectName("quickProbabilityTable")
         self.quick_probability_table.setHorizontalHeaderLabels(["Класс", "Вероятность"])
-        self.quick_probability_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.quick_probability_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.quick_probability_table.setColumnWidth(0, 180)
         self.quick_probability_table.setColumnWidth(1, 92)
         self.quick_probability_table.setMaximumHeight(180)
+        self._enable_fill_width_columns(self.quick_probability_table)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(SPACE_2)
@@ -1113,11 +1213,11 @@ class MainWindow(QMainWindow):
         self.results_table = QTableWidget(0, 4)
         self._configure_embedded_table(self.results_table)
         self.results_table.setHorizontalHeaderLabels(["#", "Текст", "Класс", "Увер."])
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.results_table.setColumnWidth(0, 45)
+        self.results_table.setColumnWidth(1, 520)
         self.results_table.setColumnWidth(2, 125)
         self.results_table.setColumnWidth(3, 80)
+        self._enable_fill_width_columns(self.results_table)
         panel.layout.addWidget(self.results_table, 1)
         return panel
 
@@ -1228,6 +1328,10 @@ class MainWindow(QMainWindow):
         self.train_base_model_combo = QComboBox()
         self.train_base_model_combo.addItems(TRAINING_BASE_MODELS)
         self.train_base_model_combo.setEditable(True)
+        for index, model_name in enumerate(TRAINING_BASE_MODELS):
+            self.train_base_model_combo.setItemData(index, QColor("#1f5fa9"), Qt.ItemDataRole.ForegroundRole)
+            self.train_base_model_combo.setItemData(index, QColor("#e8f0ff"), Qt.ItemDataRole.BackgroundRole)
+            self.train_base_model_combo.setItemData(index, f"Hugging Face: {model_name}", Qt.ItemDataRole.ToolTipRole)
         self.train_local_only_check = QCheckBox("Только локальные файлы")
         self.train_local_only_check.setChecked(False)
         self.train_trust_remote_check = QCheckBox("trust_remote_code")
@@ -1258,8 +1362,6 @@ class MainWindow(QMainWindow):
         self.train_padding_combo.addItems(["max_length", "longest"])
         self.train_truncation_check = QCheckBox("Обрезать длинные тексты")
         self.train_truncation_check.setChecked(True)
-        self.train_truncation_strategy_combo = QComboBox()
-        self.train_truncation_strategy_combo.addItems(["longest_first", "only_first", "only_second"])
         self.train_fast_tokenizer_check = QCheckBox("Fast tokenizer")
         self.train_fast_tokenizer_check.setChecked(True)
         self.train_pad_multiple_spin = QSpinBox()
@@ -1271,7 +1373,6 @@ class MainWindow(QMainWindow):
                 ("Max length", self.train_max_length_spin),
                 ("Padding", self.train_padding_combo),
                 ("Truncation", self._stack_widget(self.train_truncation_check)),
-                ("Truncation strategy", self.train_truncation_strategy_combo),
                 ("Tokenizer", self._stack_widget(self.train_fast_tokenizer_check)),
                 ("Pad to multiple of", self.train_pad_multiple_spin),
             ]),
@@ -1500,15 +1601,14 @@ class MainWindow(QMainWindow):
         form.setColumnStretch(1, 1)
         layout.addLayout(form)
 
-        self.label_mapping_table = QTableWidget(0, 3)
+        self.label_mapping_table = QTableWidget(0, 4)
         self._configure_embedded_table(self.label_mapping_table)
-        self.label_mapping_table.setHorizontalHeaderLabels(["Метка", "Кол-во", "Действие"])
-        self.label_mapping_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.label_mapping_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.label_mapping_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-
+        self.label_mapping_table.setHorizontalHeaderLabels(["Метка", "Кол-во", "Действие", "Новая метка"])
+        self.label_mapping_table.setColumnWidth(0, 220)
         self.label_mapping_table.setColumnWidth(1, 72)
         self.label_mapping_table.setColumnWidth(2, 220)
+        self.label_mapping_table.setColumnWidth(3, 220)
+        self._enable_fill_width_columns(self.label_mapping_table)
 
         self.label_mapping_table.verticalHeader().setDefaultSectionSize(44)
         self.label_mapping_table.verticalHeader().setMinimumSectionSize(44)
@@ -1518,32 +1618,240 @@ class MainWindow(QMainWindow):
         self.label_mapping_summary.setObjectName("mappingSummary")
         self.label_mapping_summary.setWordWrap(True)
         self.label_mapping_summary.hide()
+        manual_hint = QLabel(
+            "В столбце новой метки можно вручную задать целевое имя класса для любого исходного значения, "
+            "например 0 -> нейтральная или 1 -> положительная."
+        )
+        manual_hint.setObjectName("mutedLabel")
+        manual_hint.setWordWrap(True)
+        layout.addWidget(manual_hint)
         return content
 
     def _build_models_page(self) -> QWidget:
         page = self._page()
-        panel = Panel("Модели и справочные профили")
+        panel = Panel("Реестр моделей")
         note = QLabel(
-            "Обученные локальные модели доступны для анализа. Базовые checkpoints нужны для fine-tuning и не добавляются в список анализа."
+            "Реестр показывает локальные обученные модели, их схему меток и пригодность для сравнения качества. "
+            "Базовые контрольные точки нужны только для дообучения и не добавляются в список анализа."
         )
         note.setWordWrap(True)
         note.setObjectName("mutedLabel")
         panel.layout.addWidget(note)
-        self.profile_table = QTableWidget(0, 5)
+        self.profile_table = QTableWidget(0, 7)
         self._configure_embedded_table(self.profile_table)
-        self.profile_table.setHorizontalHeaderLabels(["Модель", "Источник", "Accuracy", "Macro F1", "Уверенность"])
-        self.profile_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.profile_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.profile_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.profile_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.profile_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.profile_table.setColumnWidth(1, 112)
-        self.profile_table.setColumnWidth(2, 88)
-        self.profile_table.setColumnWidth(3, 88)
-        self.profile_table.setColumnWidth(4, 108)
+        self.profile_table.setHorizontalHeaderLabels(["Модель", "Источник", "Схема меток", "Качество", "Accuracy", "Macro F1", "Действия"])
+        self.profile_table.setColumnWidth(0, 200)
+        self.profile_table.setColumnWidth(1, 132)
+        self.profile_table.setColumnWidth(2, 240)
+        self.profile_table.setColumnWidth(3, 122)
+        self.profile_table.setColumnWidth(4, 88)
+        self.profile_table.setColumnWidth(5, 88)
+        self.profile_table.setColumnWidth(6, 170)
+        self._enable_fill_width_columns(self.profile_table)
+        self.profile_table.verticalHeader().setDefaultSectionSize(self._model_action_row_height())
+        self.profile_table.verticalHeader().setMinimumSectionSize(self._model_action_row_height())
         self.profile_table.cellDoubleClicked.connect(self._select_model_from_profile)
+        self.profile_table.itemChanged.connect(self._handle_profile_item_changed)
         panel.layout.addWidget(self.profile_table, 1)
         page.layout().addWidget(panel, 1)
+        return page
+
+    def _build_comparison_page(self) -> QWidget:
+        page = self._page()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        controls = Panel("Сравнение моделей")
+        intro = QLabel(
+            "Качество считается только для моделей с совпадающей схемой меток и при выбранной колонке истинной метки. "
+            "Поведение можно сравнивать между любыми моделями."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("mutedLabel")
+        controls.layout.addWidget(intro)
+
+        toolbar = QFrame()
+        toolbar.setObjectName("comparisonToolbar")
+        toolbar_layout = QVBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(SPACE_3, SPACE_3, SPACE_3, SPACE_3)
+        toolbar_layout.setSpacing(SPACE_2)
+
+        data_grid = QGridLayout()
+        data_grid.setHorizontalSpacing(SPACE_3)
+        data_grid.setVerticalSpacing(SPACE_1)
+        data_grid.addWidget(self._comparison_field_label("Источник данных"), 0, 0)
+        data_grid.addWidget(self._comparison_field_label("Текст"), 0, 1)
+        data_grid.addWidget(self._comparison_field_label("Метка"), 0, 2)
+        self.comparison_dataset_combo = QComboBox()
+        self.comparison_dataset_combo.setMinimumWidth(180)
+        self.comparison_dataset_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.comparison_dataset_combo.currentTextChanged.connect(self._populate_comparison_columns)
+        data_grid.addWidget(self.comparison_dataset_combo, 1, 0)
+        self.comparison_text_column_combo = QComboBox()
+        self.comparison_text_column_combo.setMinimumWidth(180)
+        self.comparison_text_column_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        data_grid.addWidget(self.comparison_text_column_combo, 1, 1)
+        self.comparison_label_column_combo = QComboBox()
+        self.comparison_label_column_combo.setMinimumWidth(180)
+        self.comparison_label_column_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        data_grid.addWidget(self.comparison_label_column_combo, 1, 2)
+        data_grid.setColumnStretch(0, 1)
+        data_grid.setColumnStretch(1, 1)
+        data_grid.setColumnStretch(2, 1)
+        toolbar_layout.addLayout(data_grid)
+
+        sample_grid = QGridLayout()
+        sample_grid.setHorizontalSpacing(SPACE_3)
+        sample_grid.setVerticalSpacing(SPACE_1)
+        sample_grid.addWidget(self._comparison_field_label("Отбор строк"), 0, 0)
+        sample_grid.addWidget(self._comparison_field_label("Максимум строк"), 0, 1)
+        self.comparison_sampling_combo = QComboBox()
+        self.comparison_sampling_combo.addItem("По порядку", "ordered")
+        self.comparison_sampling_combo.addItem("Случайно", "random")
+        self.comparison_sampling_combo.setMinimumWidth(140)
+        sample_grid.addWidget(self.comparison_sampling_combo, 1, 0)
+        self.comparison_max_rows_spin = QSpinBox()
+        self.comparison_max_rows_spin.setRange(0, 10_000_000)
+        self.comparison_max_rows_spin.setValue(0)
+        self.comparison_max_rows_spin.setSpecialValueText("все строки")
+        self.comparison_max_rows_spin.setMinimumWidth(140)
+        sample_grid.addWidget(self.comparison_max_rows_spin, 1, 1)
+        sample_grid.setColumnStretch(0, 1)
+        sample_grid.setColumnStretch(1, 1)
+        toolbar_layout.addLayout(sample_grid)
+
+        sampling_note = QLabel(
+            "0 = весь датасет. При ограничении можно взять первые N строк или случайную подвыборку."
+        )
+        sampling_note.setObjectName("comparisonHint")
+        sampling_note.setWordWrap(True)
+        toolbar_layout.addWidget(sampling_note)
+        controls.layout.addWidget(toolbar)
+
+        self.comparison_status_label = QLabel("Выберите минимум две модели и датасет для сравнения.")
+        self.comparison_status_label.setObjectName("comparisonStatusBox")
+        self.comparison_status_label.setWordWrap(True)
+        controls.layout.addWidget(self.comparison_status_label)
+
+        self.comparison_model_table = QTableWidget(0, 4)
+        self._configure_embedded_table(self.comparison_model_table)
+        self.comparison_model_table.setHorizontalHeaderLabels(["Сравнить", "Модель", "Источник", "Схема меток"])
+        self.comparison_model_table.setColumnWidth(0, 82)
+        self.comparison_model_table.setColumnWidth(1, 220)
+        self.comparison_model_table.setColumnWidth(2, 132)
+        self.comparison_model_table.setColumnWidth(3, 220)
+        self._enable_fill_width_columns(self.comparison_model_table)
+        controls.layout.addWidget(self.comparison_model_table, 1)
+
+        compare_row = QHBoxLayout()
+        compare_row.setSpacing(SPACE_2)
+        self.run_comparison_button = QPushButton("Сравнить модели")
+        self.run_comparison_button.setObjectName("primaryButton")
+        self.run_comparison_button.clicked.connect(self.run_model_comparison)
+        select_all_button = QPushButton("Выбрать все")
+        select_all_button.clicked.connect(lambda: self._set_comparison_selection(True))
+        clear_all_button = QPushButton("Снять выбор")
+        clear_all_button.clicked.connect(lambda: self._set_comparison_selection(False))
+        compare_row.addWidget(self.run_comparison_button)
+        compare_row.addWidget(select_all_button)
+        compare_row.addWidget(clear_all_button)
+        compare_row.addStretch(1)
+        controls.layout.addLayout(compare_row)
+
+        results = QWidget()
+        results.setMinimumWidth(460)
+        results_layout = QVBoxLayout(results)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(SPACE_3)
+
+        results_tabs = TrainingTabWidget()
+        results_tabs.setObjectName("comparisonTabs")
+
+        charts_content = QWidget()
+        charts_layout = QVBoxLayout(charts_content)
+        charts_layout.setContentsMargins(0, 0, 0, 0)
+        charts_layout.setSpacing(SPACE_3)
+        self.comparison_quality_chart = ChartWidget("Качество по моделям", 260)
+        self.comparison_behavior_chart = ChartWidget("Уверенность и сомнения", 260)
+        self.comparison_speed_chart = ChartWidget("Время анализа", 240)
+        self.comparison_disagreement_chart = ChartWidget("Расхождения между моделями", 280)
+        self.comparison_quality_chart.empty("График качества появится после сравнения")
+        self.comparison_behavior_chart.empty("График поведения появится после сравнения")
+        self.comparison_speed_chart.empty("График времени появится после сравнения")
+        self.comparison_disagreement_chart.empty("График расхождений появится после сравнения")
+        charts_layout.addWidget(self.comparison_quality_chart)
+        charts_layout.addWidget(self.comparison_behavior_chart)
+        charts_layout.addWidget(self.comparison_speed_chart)
+        charts_layout.addWidget(self.comparison_disagreement_chart)
+        charts_layout.addStretch(1)
+
+        charts_scroll = QScrollArea()
+        charts_scroll.setWidgetResizable(True)
+        charts_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        charts_scroll.setWidget(charts_content)
+        results_tabs.addTab(charts_scroll, "Графики")
+
+        tables_page = QWidget()
+        tables_layout = QVBoxLayout(tables_page)
+        tables_layout.setContentsMargins(0, 0, 0, 0)
+        tables_layout.setSpacing(SPACE_3)
+
+        quality_panel = Panel("Качество")
+        self.comparison_quality_summary = QLabel("Сравнение качества появится после запуска.")
+        self.comparison_quality_summary.setObjectName("mutedLabel")
+        self.comparison_quality_summary.setWordWrap(True)
+        quality_panel.layout.addWidget(self.comparison_quality_summary)
+        self.comparison_quality_table = QTableWidget(0, 5)
+        self._configure_embedded_table(self.comparison_quality_table)
+        self.comparison_quality_table.setHorizontalHeaderLabels(["Модель", "Метки", "Строк", "Accuracy", "Macro F1"])
+        self.comparison_quality_table.setColumnWidth(0, 180)
+        self.comparison_quality_table.setColumnWidth(1, 260)
+        self.comparison_quality_table.setColumnWidth(2, 84)
+        self.comparison_quality_table.setColumnWidth(3, 90)
+        self.comparison_quality_table.setColumnWidth(4, 90)
+        self._enable_fill_width_columns(self.comparison_quality_table)
+        quality_panel.layout.addWidget(self.comparison_quality_table, 1)
+        tables_layout.addWidget(quality_panel, 1)
+
+        behavior_panel = Panel("Поведение")
+        self.comparison_behavior_table = QTableWidget(0, 8)
+        self._configure_embedded_table(self.comparison_behavior_table)
+        self.comparison_behavior_table.setHorizontalHeaderLabels(
+            ["Модель", "Метки", "Средняя уверенность", "Медиана", "Низкая уверенность", "Энтропия", "Доля топ-класса", "Секунды"]
+        )
+        self.comparison_behavior_table.setColumnWidth(0, 180)
+        self.comparison_behavior_table.setColumnWidth(1, 260)
+        self.comparison_behavior_table.setColumnWidth(2, 150)
+        self.comparison_behavior_table.setColumnWidth(3, 96)
+        self.comparison_behavior_table.setColumnWidth(4, 150)
+        self.comparison_behavior_table.setColumnWidth(5, 96)
+        self.comparison_behavior_table.setColumnWidth(6, 132)
+        self.comparison_behavior_table.setColumnWidth(7, 96)
+        self._enable_fill_width_columns(self.comparison_behavior_table)
+        behavior_panel.layout.addWidget(self.comparison_behavior_table, 1)
+        tables_layout.addWidget(behavior_panel, 1)
+
+        disagreement_panel = Panel("Расхождения")
+        self.comparison_disagreement_table = QTableWidget(0, 3)
+        self._configure_embedded_table(self.comparison_disagreement_table)
+        self.comparison_disagreement_table.setHorizontalHeaderLabels(["#", "Текст", "Предсказания"])
+        self.comparison_disagreement_table.setColumnWidth(0, 44)
+        self.comparison_disagreement_table.setColumnWidth(1, 320)
+        self.comparison_disagreement_table.setColumnWidth(2, 420)
+        self._enable_fill_width_columns(self.comparison_disagreement_table)
+        disagreement_panel.layout.addWidget(self.comparison_disagreement_table, 1)
+        tables_layout.addWidget(disagreement_panel, 1)
+
+        results_tabs.addTab(tables_page, "Таблицы")
+        results_layout.addWidget(results_tabs, 1)
+
+        splitter.addWidget(controls)
+        splitter.addWidget(results)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([440, 820])
+
+        page.layout().addWidget(splitter, 1)
         return page
 
     def _build_monitoring_page(self) -> QWidget:
@@ -1575,8 +1883,9 @@ class MainWindow(QMainWindow):
         self.monitoring_table = QTableWidget(0, 2)
         self._configure_embedded_table(self.monitoring_table)
         self.monitoring_table.setHorizontalHeaderLabels(["Показатель", "Значение"])
-        self.monitoring_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.monitoring_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.monitoring_table.setColumnWidth(0, 220)
+        self.monitoring_table.setColumnWidth(1, 120)
+        self._enable_fill_width_columns(self.monitoring_table)
         panel.layout.addWidget(self.monitoring_summary_label)
         panel.layout.addWidget(self.monitoring_table, 1)
         splitter.addWidget(panel)
@@ -1743,6 +2052,11 @@ class MainWindow(QMainWindow):
             label_widget.setToolTip(help_text)
         return label_widget
 
+    def _comparison_field_label(self, label: str) -> QLabel:
+        label_widget = QLabel(label)
+        label_widget.setObjectName("comparisonFieldLabel")
+        return label_widget
+
     def _field_cell(self, label: str, widget: QWidget, show_help: bool = True) -> QWidget:
         help_text = TRAINING_FIELD_HELP.get(label, "")
         if help_text:
@@ -1808,9 +2122,87 @@ class MainWindow(QMainWindow):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        table.horizontalHeader().setHighlightSections(False)
+        header = table.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setCascadingSectionResizes(False)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(48)
         table.verticalHeader().setVisible(False)
         table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _enable_fill_width_columns(self, table: QTableWidget) -> None:
+        table_id = id(table)
+        viewport_id = id(table.viewport())
+        self._fill_width_tables[table_id] = table
+        self._fill_width_viewports[viewport_id] = table
+        table.viewport().installEventFilter(self)
+        table.installEventFilter(self)
+        table.horizontalHeader().sectionResized.connect(
+            lambda section, old_size, new_size, target=table: self._rebalance_table_columns(target, section)
+        )
+        self._rebalance_table_columns(table)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        table = self._fill_width_viewports.get(id(watched))
+        if table is None and isinstance(watched, QTableWidget):
+            table = self._fill_width_tables.get(id(watched))
+        if table is not None and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
+            self._rebalance_table_columns(table)
+        return super().eventFilter(watched, event)
+
+    def _rebalance_table_columns(self, table: QTableWidget, preferred_section: int | None = None) -> None:
+        if table.columnCount() == 0:
+            return
+        table_id = id(table)
+        if table_id in self._table_resize_guard:
+            return
+
+        viewport_width = max(table.viewport().width(), 0)
+        if viewport_width <= 0:
+            return
+
+        header = table.horizontalHeader()
+        widths = [header.sectionSize(index) for index in range(table.columnCount())]
+        total_width = sum(widths)
+        min_width = max(header.minimumSectionSize(), 48)
+        target_width = max(viewport_width - 2, min_width * table.columnCount())
+        delta = target_width - total_width
+        if delta == 0:
+            return
+
+        self._table_resize_guard.add(table_id)
+        try:
+            if delta > 0:
+                last_index = table.columnCount() - 1
+                table.setColumnWidth(last_index, widths[last_index] + delta)
+                return
+
+            remaining = -delta
+            candidate_indexes = [
+                index
+                for index in range(table.columnCount() - 1, -1, -1)
+                if index != preferred_section
+            ]
+            if preferred_section is not None:
+                candidate_indexes.append(preferred_section)
+
+            current_widths = widths[:]
+            for index in candidate_indexes:
+                reducible = max(current_widths[index] - min_width, 0)
+                if reducible <= 0:
+                    continue
+                shrink = min(reducible, remaining)
+                if shrink > 0:
+                    current_widths[index] -= shrink
+                    remaining -= shrink
+                if remaining <= 0:
+                    break
+
+            for index, width in enumerate(current_widths):
+                table.setColumnWidth(index, width)
+        finally:
+            self._table_resize_guard.discard(table_id)
 
     def _set_status(self, text: str, state: str = "ready") -> None:
         if hasattr(self, "status_label"):
@@ -1830,6 +2222,8 @@ class MainWindow(QMainWindow):
         self.train_button.setEnabled(False)
         self._switch_page(0)
         self.populate_profile_table()
+        self.populate_comparison_model_table()
+        self._refresh_comparison_inputs()
         self._refresh_empty_charts()
         self._refresh_workflow_state()
         self._refresh_dataset_summary()
@@ -1882,6 +2276,7 @@ class MainWindow(QMainWindow):
 
         self.dataset_path = Path(path)
         self._populate_training_columns()
+        self._refresh_comparison_inputs()
         self.results = []
         self.preview_offset = 0
         self._refresh_dataset_summary()
@@ -1910,6 +2305,7 @@ class MainWindow(QMainWindow):
         self.train_label_column_combo.clear()
         self.train_label_column_combo.blockSignals(False)
         self.train_button.setEnabled(False)
+        self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.populate_results_table([])
         self.refresh_analysis()
@@ -1937,6 +2333,7 @@ class MainWindow(QMainWindow):
         self.analysis_dataset_path = Path(path)
         self.results = []
         self._populate_analysis_columns()
+        self._refresh_comparison_inputs()
         self.refresh_analysis()
         self.analyze_button.setEnabled(True)
         self.analysis_clear_button.setEnabled(True)
@@ -1957,6 +2354,7 @@ class MainWindow(QMainWindow):
         self.results = []
         self.text_column_combo.clear()
         self.text_column_combo.addItem("text")
+        self._refresh_comparison_inputs()
         self.analysis_dataset_label.setText("Файл для пакетного анализа не загружен.")
         self.analysis_dataset_label.setToolTip("")
         self.analyze_button.setEnabled(False)
@@ -1981,6 +2379,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки", str(exc))
             return
         self.val_dataset_path = Path(path)
+        self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.refresh_label_mapping_table()
         self.statusBar().showMessage(
@@ -1995,6 +2394,7 @@ class MainWindow(QMainWindow):
             return
         self.val_data_frame = pd.DataFrame()
         self.val_dataset_path = None
+        self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.refresh_label_mapping_table()
         if self.preview_source == "val":
@@ -2017,6 +2417,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки", str(exc))
             return
         self.test_dataset_path = Path(path)
+        self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.refresh_label_mapping_table()
         self.statusBar().showMessage(
@@ -2031,6 +2432,7 @@ class MainWindow(QMainWindow):
             return
         self.test_data_frame = pd.DataFrame()
         self.test_dataset_path = None
+        self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.refresh_label_mapping_table()
         if self.preview_source == "test":
@@ -2071,7 +2473,7 @@ class MainWindow(QMainWindow):
             self.val_status_label.setText(
                 "Не загружен. Validation будет отделена из train по проценту в настройках обучения."
             )
-            self.val_rows_card.set_values("—", "не загружен")
+            self.val_rows_card.set_values("-", "не загружен")
         self.val_clear_button.setEnabled(val_loaded)
 
         if test_loaded and self.test_dataset_path is not None:
@@ -2084,7 +2486,7 @@ class MainWindow(QMainWindow):
             self.test_status_label.setText(
                 "Не загружен. Test будет отделён из train по проценту в настройках обучения."
             )
-            self.test_rows_card.set_values("—", "не загружен")
+            self.test_rows_card.set_values("-", "не загружен")
         self.test_clear_button.setEnabled(test_loaded)
 
         self._refresh_validation_split_state()
@@ -2110,12 +2512,12 @@ class MainWindow(QMainWindow):
         if not self.val_data_frame.empty:
             self.context_val_label.setText(format_int(len(self.val_data_frame)))
         else:
-            self.context_val_label.setText("—")
+            self.context_val_label.setText("-")
 
         if not self.test_data_frame.empty:
             self.context_test_label.setText(format_int(len(self.test_data_frame)))
         else:
-            self.context_test_label.setText("—")
+            self.context_test_label.setText("-")
 
         model_name = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
         self.context_model_label.setText(self._format_context_model(model_name))
@@ -2129,7 +2531,7 @@ class MainWindow(QMainWindow):
     def _format_context_model(model_name: str) -> str:
         name = model_name.strip()
         if not name:
-            return "—"
+            return "-"
         path = Path(name)
         if path.exists() or name.startswith("models/") or "\\" in name or (":" in name and "/" not in name):
             return path.name
@@ -2164,7 +2566,7 @@ class MainWindow(QMainWindow):
         external_test = not self.test_data_frame.empty
         self.train_val_split_spin.setEnabled(not external_val)
         self.train_test_split_spin.setEnabled(not external_test)
-        # split_seed / stratify влияют на оба сплита — оставляем активными, если хотя бы один сплит нужен
+        # split_seed / stratify влияют на оба сплита - оставляем активными, если хотя бы один сплит нужен
         any_split = not external_val or not external_test
         self.train_split_seed_spin.setEnabled(any_split)
         self.train_stratify_check.setEnabled(any_split)
@@ -2373,7 +2775,7 @@ class MainWindow(QMainWindow):
                 "Нет словаря токенайзера",
                 "В папке нет файла словаря токенайзера: tokenizer.json (fast), "
                 "vocab.txt (BERT/DistilBERT), spiece.model / sentencepiece.bpe.model (XLM-R/T5) "
-                "или tokenizer.model. Без него токенайзер не сможет загрузиться — "
+                "или tokenizer.model. Без него токенайзер не сможет загрузиться - "
                 "скопируйте недостающий файл из папки базовой модели.",
             )
             return
@@ -2382,7 +2784,7 @@ class MainWindow(QMainWindow):
         if self.model_combo.findText(path_str) == -1:
             self.model_combo.addItem(path_str)
         self.model_combo.setCurrentText(path_str)
-        self.populate_profile_table()
+        self._refresh_model_lists(path_str)
         self._log(f"Подключена локальная модель: {path_str}.")
         self.statusBar().showMessage(f"Локальная модель выбрана: {folder.name}")
 
@@ -2472,7 +2874,6 @@ class MainWindow(QMainWindow):
             max_length=self.train_max_length_spin.value(),
             padding=self.train_padding_combo.currentText(),
             truncation=self.train_truncation_check.isChecked(),
-            truncation_strategy=self.train_truncation_strategy_combo.currentText(),
             use_fast_tokenizer=self.train_fast_tokenizer_check.isChecked(),
             pad_to_multiple_of=self.train_pad_multiple_spin.value() or None,
             device=self.train_device_combo.currentText(),
@@ -2579,7 +2980,7 @@ class MainWindow(QMainWindow):
         if self.model_combo.findText(output_path) == -1:
             self.model_combo.addItem(output_path)
         self.model_combo.setCurrentText(output_path)
-        self.populate_profile_table()
+        self._refresh_model_lists(output_path)
         self.statusBar().showMessage(f"Модель обучена и сохранена: {output_path}")
         self._log(f"Обучение завершено. Модель сохранена: {output_path}.")
 
@@ -2719,7 +3120,9 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "label_mapping_table"):
             return
 
+        current_mapping = self._current_label_mapping()
         self.label_action_combos.clear()
+        self.label_target_edits.clear()
         self.label_mapping_table.setRowCount(0)
         self.label_count_by_token = Counter()
 
@@ -2741,19 +3144,26 @@ class MainWindow(QMainWindow):
                     self.label_count_by_token[token] += 1
 
         rows = sorted(self.label_count_by_token.items(), key=lambda item: (-item[1], label_key(item[0])))
-        header = "Sentiment" if self.target_scheme_combo.currentText() == SENTIMENT_SCHEME else "Действие"
-        self.label_mapping_table.setHorizontalHeaderLabels(["Метка", "Кол-во", header])
+        self.label_mapping_table.setHorizontalHeaderLabels(["Метка", "Кол-во", "Действие", "Новая метка"])
         self.label_mapping_table.setRowCount(len(rows))
         for row, (raw_label, count) in enumerate(rows):
             self.label_mapping_table.setItem(row, 0, QTableWidgetItem(raw_label))
             self.label_mapping_table.setItem(row, 1, QTableWidgetItem(format_int(count)))
 
-            action = self._default_label_action(raw_label)
+            config = current_mapping.get(raw_label, {"action": self._default_label_action(raw_label), "custom": ""})
+            action = str(config.get("action") or self._default_label_action(raw_label))
             combo = make_combo(self._label_action_values(), action)
+            combo.setToolTip("Выберите действие для исходной метки.")
             combo.currentTextChanged.connect(self.update_label_mapping_summary)
 
+            custom_edit = QLineEdit(str(config.get("custom") or ""))
+            custom_edit.setPlaceholderText("Например: positive")
+            custom_edit.editingFinished.connect(self.update_label_mapping_summary)
+
             self.label_action_combos[raw_label] = combo
+            self.label_target_edits[raw_label] = custom_edit
             self.label_mapping_table.setCellWidget(row, 2, combo)
+            self.label_mapping_table.setCellWidget(row, 3, custom_edit)
             self.label_mapping_table.setRowHeight(row, 44)
 
         self.update_label_mapping_summary()
@@ -2764,12 +3174,29 @@ class MainWindow(QMainWindow):
         for raw_label, combo in self.label_action_combos.items():
             action = self._default_label_action(raw_label)
             combo.setCurrentText(action)
+            target_edit = self.label_target_edits.get(raw_label)
+            if target_edit is not None:
+                target_edit.clear()
         self.update_label_mapping_summary()
 
-    def _current_label_mapping(self) -> dict[str, str]:
-        return {raw_label: combo.currentText() for raw_label, combo in self.label_action_combos.items()}
+    def _current_label_mapping(self) -> dict[str, dict[str, str]]:
+        mapping: dict[str, dict[str, str]] = {}
+        for raw_label, combo in self.label_action_combos.items():
+            target_edit = self.label_target_edits.get(raw_label)
+            mapping[raw_label] = {
+                "action": combo.currentText().strip() or self._default_label_action(raw_label),
+                "custom": target_edit.text().strip() if target_edit is not None else "",
+            }
+        return mapping
 
-    def _map_tokens_to_target(self, tokens: list[str], mapping: dict[str, str]) -> str | None:
+    def _map_label_value(self, raw_value: object) -> str | None:
+        tokens = parse_label_tokens(
+            raw_value,
+            parse_as_list=self.label_format_combo.currentText() == "Список меток в строке",
+        )
+        return self._map_tokens_to_target(tokens, self._current_label_mapping())
+
+    def _map_tokens_to_target(self, tokens: list[str], mapping: dict[str, dict[str, str]]) -> str | None:
         if not tokens:
             return None
 
@@ -2783,7 +3210,11 @@ class MainWindow(QMainWindow):
             tokens = tokens[:1]
 
         for token in tokens:
-            action = mapping.get(token, auto_target_for_label(token))
+            config = mapping.get(token)
+            action = str(config.get("action") if config else auto_target_for_label(token))
+            custom_target = str(config.get("custom") or "").strip() if config else ""
+            if custom_target:
+                return custom_target
             if action == EXCLUDE_LABEL:
                 continue
             if action == KEEP_ORIGINAL:
@@ -2908,13 +3339,17 @@ class MainWindow(QMainWindow):
         self.preview_table.setHorizontalHeaderLabels([str(column) for column in frame.columns])
         header = self.preview_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column_index in range(len(frame.columns)):
+            if self.preview_table.columnWidth(column_index) < 120:
+                self.preview_table.setColumnWidth(column_index, 120)
         if len(frame.columns) > 0:
             preferred = self.text_column_combo.currentText()
             preferred_index = list(frame.columns).index(preferred) if preferred in frame.columns else 0
-            header.setSectionResizeMode(preferred_index, QHeaderView.ResizeMode.Stretch)
+            self.preview_table.setColumnWidth(preferred_index, max(self.preview_table.columnWidth(preferred_index), 320))
         for row_index, (_, row) in enumerate(frame.iterrows()):
             for column_index, value in enumerate(row):
                 self.preview_table.setItem(row_index, column_index, QTableWidgetItem(str(value)[:300]))
+        self._rebalance_table_columns(self.preview_table)
         start = self.preview_offset + 1
         end = self.preview_offset + len(frame)
         if hasattr(self, "preview_range_label"):
@@ -2967,9 +3402,8 @@ class MainWindow(QMainWindow):
                 header_item.setToolTip(label)
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        if len(headers) > 1:
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.results_table.setColumnWidth(0, 45)
+        self.results_table.setColumnWidth(1, 520)
         self.results_table.setColumnWidth(2, 128)
         self.results_table.setColumnWidth(3, 80)
         for column in range(4, 4 + len(score_labels)):
@@ -2988,6 +3422,7 @@ class MainWindow(QMainWindow):
                 if column == 2:
                     item.setForeground(QColor(SENTIMENT_COLORS.get(result.sentiment, "#111827")))
                 self.results_table.setItem(row, column, item)
+        self._rebalance_table_columns(self.results_table)
 
     def populate_profile_table(self) -> None:
         if not hasattr(self, "profile_table"):
@@ -3007,30 +3442,578 @@ class MainWindow(QMainWindow):
                     rows.append(self._local_model_profile(model_name))
                     known.add(identity)
 
-        self.profile_table.setRowCount(len(rows))
-        for row, profile in enumerate(rows):
-            name = str(profile["name"])
+        deduped_rows: list[dict[str, float | int | str | bool]] = []
+        seen_registry_keys: set[str] = set()
+        for profile in rows:
+            registry_key = str(profile.get("registry_key") or self._model_identity(str(profile["name"])))
+            if registry_key in seen_registry_keys:
+                continue
+            seen_registry_keys.add(registry_key)
+            deduped_rows.append(profile)
+
+        rows = sorted(
+            deduped_rows,
+            key=lambda profile: (
+                0 if str(profile.get("status")) == "локальная обученная" else 1,
+                str(profile.get("display_name") or profile.get("name") or "").casefold(),
+            ),
+        )
+
+        self._populating_profile_table = True
+        try:
+            self.profile_table.clearContents()
+            self.profile_table.setRowCount(len(rows))
+            for row, profile in enumerate(rows):
+                name = str(profile["name"])
+                display_name = str(profile.get("display_name") or self._display_model_name(name))
+                status = str(profile.get("status") or self._model_status(name))
+                can_rename = bool(profile.get("can_rename"))
+                values = [
+                    display_name,
+                    status,
+                    str(profile.get("label_schema") or "-"),
+                    str(profile.get("quality_group") or "-"),
+                    self._format_profile_metric(profile.get("accuracy")),
+                    self._format_profile_metric(profile.get("macro_f1")),
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, name)
+                        item.setToolTip(name)
+                        if can_rename:
+                            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                    if hasattr(self, "model_combo") and name == self.model_combo.currentText():
+                        item.setBackground(QColor("#d7e5fb"))
+                    self.profile_table.setItem(row, column, item)
+                self.profile_table.setRowHeight(row, self._model_action_row_height())
+                self.profile_table.setCellWidget(row, 6, self._build_model_action_cell(name, can_rename, status))
+        finally:
+            self._populating_profile_table = False
+
+    def _selected_profile_model_path(self) -> Path | None:
+        if not hasattr(self, "profile_table"):
+            return None
+        current_row = self.profile_table.currentRow()
+        if current_row < 0:
+            return None
+        item = self.profile_table.item(current_row, 0)
+        if item is None:
+            return None
+        path = Path(str(item.data(Qt.ItemDataRole.UserRole) or item.text()))
+        if not path.exists() or not path.is_dir():
+            return None
+        return path
+
+    def _refresh_model_lists(self, selected_model: str | None = None) -> None:
+        self._refresh_inference_model_choices(selected_model)
+        self.populate_profile_table()
+        self.populate_comparison_model_table()
+        self._update_context_bar()
+
+    def _refresh_inference_model_choices(self, selected_model: str | None = None) -> None:
+        if not hasattr(self, "model_combo"):
+            return
+        current_text = selected_model or self.model_combo.currentText()
+        models = self._inference_local_models()
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for model_path in models:
+            self.model_combo.addItem(model_path)
+        if current_text and self.model_combo.findText(current_text) == -1 and Path(current_text).exists():
+            self.model_combo.addItem(current_text)
+        if current_text:
+            self.model_combo.setCurrentText(current_text)
+        self.model_combo.blockSignals(False)
+
+    def rename_selected_model(self, model_name: str | None = None) -> None:
+        path = Path(model_name) if model_name else self._selected_profile_model_path()
+        if path is None:
+            QMessageBox.information(self, "Нет модели", "Выберите локальную модель в таблице.")
+            return
+        if not self._is_trained_inference_model(path):
+            QMessageBox.information(
+                self,
+                "Переименование недоступно",
+                "Базовые модели для обучения нельзя переименовывать из интерфейса.",
+            )
+            return
+
+        row = self._find_profile_row(str(path.resolve()))
+        if row is None:
+            return
+        item = self.profile_table.item(row, 0)
+        if item is None:
+            return
+
+        self._pending_profile_rename_path = str(path.resolve())
+        self._pending_profile_rename_original_name = item.text().strip()
+        self.profile_table.setCurrentCell(row, 0)
+        self.profile_table.editItem(item)
+
+    def delete_selected_model(self, model_name: str | None = None) -> None:
+        path = Path(model_name) if model_name else self._selected_profile_model_path()
+        if path is None:
+            QMessageBox.information(self, "Нет модели", "Выберите локальную модель в таблице.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Удалить модель",
+            f"Удалить папку модели '{path.name}' со всеми файлами?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        current_model = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
+        next_model = "" if Path(current_model) == path else current_model
+        try:
+            shutil.rmtree(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось удалить", str(exc))
+            return
+
+        self._refresh_model_lists(next_model)
+        self.statusBar().showMessage(f"Модель удалена: {path.name}")
+        self._log(f"Модель удалена: {path}.")
+
+    def _build_model_action_cell(self, model_name: str, can_rename: bool, status: str) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        path = Path(model_name)
+        button_height = self._model_action_button_height()
+        delete_button = QPushButton("Удалить")
+        delete_button.setObjectName("tableDangerActionButton")
+        delete_button.setFixedHeight(button_height)
+        delete_button.setEnabled(path.exists() and path.is_dir())
+        delete_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        delete_button.clicked.connect(lambda checked=False, name=model_name: self.delete_selected_model(name))
+
+        if can_rename:
+            rename_button = QPushButton("Переим.")
+            rename_button.setObjectName("tableActionButton")
+            rename_button.setFixedHeight(button_height)
+            rename_button.setEnabled(path.exists() and path.is_dir())
+            rename_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            rename_button.clicked.connect(lambda checked=False, name=model_name: self.rename_selected_model(name))
+            layout.addWidget(rename_button)
+        layout.addWidget(delete_button)
+        widget.setMinimumHeight(self._model_action_row_height() - 4)
+        return widget
+
+    def _model_action_button_height(self) -> int:
+        return max(36, self.fontMetrics().height() + 18)
+
+    def _model_action_row_height(self) -> int:
+        return self._model_action_button_height() + 18
+
+    @staticmethod
+    def _display_model_name(model_name: str) -> str:
+        path = Path(model_name)
+        if path.name and (path.exists() or any(sep in model_name for sep in ("\\", "/"))):
+            return path.name
+        return model_name
+
+    def populate_comparison_model_table(self) -> None:
+        if not hasattr(self, "comparison_model_table"):
+            return
+        models = self._inference_local_models()
+        self.comparison_model_table.setRowCount(len(models))
+        for row, model_path in enumerate(models):
+            selected_item = QTableWidgetItem()
+            selected_item.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            selected_item.setCheckState(Qt.CheckState.Unchecked)
+            self.comparison_model_table.setItem(row, 0, selected_item)
+            schema = inspect_model_schema(model_path)
+            model_item = QTableWidgetItem(self._display_model_name(model_path))
+            model_item.setData(Qt.ItemDataRole.UserRole, model_path)
+            self.comparison_model_table.setItem(row, 1, model_item)
             values = [
-                name,
-                str(profile.get("status") or self._model_status(name)),
-                self._format_profile_metric(profile.get("accuracy")),
-                self._format_profile_metric(profile.get("macro_f1")),
-                self._format_profile_metric(profile.get("confidence")),
+                self._model_status(model_path),
+                self._schema_signature(schema.labels),
+            ]
+            for column, value in enumerate(values, start=2):
+                self.comparison_model_table.setItem(row, column, QTableWidgetItem(value))
+        self.comparison_status_label.setText(
+            "Выберите минимум две локальные обученные модели. Сравнение качества включится только для совместимых схем меток."
+        )
+
+    def _set_comparison_selection(self, checked: bool) -> None:
+        if not hasattr(self, "comparison_model_table"):
+            return
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.comparison_model_table.rowCount()):
+            item = self.comparison_model_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(state)
+
+    def _refresh_comparison_inputs(self) -> None:
+        if not hasattr(self, "comparison_dataset_combo"):
+            return
+        current_value = self.comparison_dataset_combo.currentData()
+        options: list[tuple[str, str]] = []
+        if not self.analysis_data_frame.empty:
+            options.append(("analysis", "Файл анализа"))
+        if not self.data_frame.empty:
+            options.append(("train", "Train-датасет"))
+        if not self.val_data_frame.empty:
+            options.append(("validation", "Validation-датасет"))
+        if not self.test_data_frame.empty:
+            options.append(("test", "Test-датасет"))
+        if not options:
+            options = [("none", "Нет данных")]
+        self.comparison_dataset_combo.blockSignals(True)
+        self.comparison_dataset_combo.clear()
+        for key, title in options:
+            self.comparison_dataset_combo.addItem(title, key)
+        target_index = next((index for index, (key, _) in enumerate(options) if key == current_value), 0)
+        self.comparison_dataset_combo.setCurrentIndex(target_index)
+        self.comparison_dataset_combo.blockSignals(False)
+        self._populate_comparison_columns()
+        self.populate_comparison_model_table()
+
+    def _populate_comparison_columns(self) -> None:
+        if not hasattr(self, "comparison_text_column_combo"):
+            return
+        frame = self._current_comparison_frame()
+        self.comparison_text_column_combo.clear()
+        self.comparison_label_column_combo.clear()
+        self.comparison_label_column_combo.addItem("Без колонки метки")
+        if frame.empty:
+            self.comparison_text_column_combo.addItem("text")
+            return
+        columns = [str(column) for column in frame.columns]
+        self.comparison_text_column_combo.addItems(columns)
+        self.comparison_label_column_combo.addItems(columns)
+        preferred_text = next(
+            (column for column in columns if column.lower() in {"text", "текст", "review", "content", "message"}),
+            columns[0],
+        )
+        preferred_label = next(
+            (column for column in columns if column.lower() in {"label", "labels", "sentiment", "тональность", "class", "target", "y"}),
+            "Без колонки метки",
+        )
+        self.comparison_text_column_combo.setCurrentText(preferred_text)
+        if preferred_label in columns:
+            self.comparison_label_column_combo.setCurrentText(preferred_label)
+
+    def _current_comparison_frame(self) -> pd.DataFrame:
+        if not hasattr(self, "comparison_dataset_combo"):
+            return pd.DataFrame()
+        mapping = {
+            "analysis": self.analysis_data_frame,
+            "train": self.data_frame,
+            "validation": self.val_data_frame,
+            "test": self.test_data_frame,
+        }
+        return mapping.get(str(self.comparison_dataset_combo.currentData()), pd.DataFrame())
+
+    def _selected_comparison_models(self) -> list[str]:
+        models: list[str] = []
+        if not hasattr(self, "comparison_model_table"):
+            return models
+        for row in range(self.comparison_model_table.rowCount()):
+            state_item = self.comparison_model_table.item(row, 0)
+            model_item = self.comparison_model_table.item(row, 1)
+            if state_item is None or model_item is None:
+                continue
+            if state_item.checkState() == Qt.CheckState.Checked:
+                models.append(str(model_item.data(Qt.ItemDataRole.UserRole) or model_item.text()))
+        return models
+
+    def run_model_comparison(self) -> None:
+        selected_models = self._selected_comparison_models()
+        if len(selected_models) < 2:
+            QMessageBox.information(self, "Недостаточно моделей", "Выберите минимум две локальные модели для сравнения.")
+            return
+
+        frame = self._current_comparison_frame()
+        if frame.empty:
+            QMessageBox.information(self, "Нет данных", "Загрузите датасет для анализа, train, validation или test.")
+            return
+
+        text_column = self.comparison_text_column_combo.currentText()
+        label_column = self.comparison_label_column_combo.currentText()
+        if text_column not in frame.columns:
+            QMessageBox.warning(self, "Нет текстовой колонки", "Выберите корректную колонку с текстом.")
+            return
+
+        sources_column = self._guess_source_column(frame)
+        records: list[tuple[str, str, str]] = []
+        text_rows = 0
+        use_labels = label_column and label_column != "Без колонки метки" and label_column in frame.columns
+        for _, row in frame.iterrows():
+            text = str(row.get(text_column, "")).strip()
+            if not text:
+                continue
+            text_rows += 1
+            label = ""
+            if use_labels:
+                if str(self.comparison_dataset_combo.currentData()) in {"train", "validation", "test"}:
+                    mapped_label = self._map_label_value(row.get(label_column, ""))
+                    label = str(mapped_label).strip() if mapped_label is not None else ""
+                else:
+                    label = str(row.get(label_column, "")).strip()
+            if use_labels and not label:
+                continue
+            if use_labels:
+                records.append((text, label, str(row.get(sources_column, "")).strip() if sources_column else ""))
+            else:
+                records.append((text, "", str(row.get(sources_column, "")).strip() if sources_column else ""))
+
+        if not records:
+            if use_labels and text_rows > 0:
+                QMessageBox.warning(self, "Нет меток", "В выбранной колонке нет непустых истинных меток.")
+                return
+            QMessageBox.information(self, "Нет текстов", "В выбранной колонке нет непустых текстов.")
+            return
+
+        candidate_count = len(records)
+        max_rows = self.comparison_max_rows_spin.value() if hasattr(self, "comparison_max_rows_spin") else 0
+        selection_mode = str(self.comparison_sampling_combo.currentData() or "ordered")
+        selection_note = f"все {format_int(candidate_count)}"
+        if max_rows > 0 and candidate_count > max_rows:
+            if selection_mode == "random":
+                randomizer = random.Random(42)
+                selected_indexes = sorted(randomizer.sample(range(candidate_count), max_rows))
+                records = [records[index] for index in selected_indexes]
+                selection_note = f"случайная подвыборка {format_int(max_rows)} из {format_int(candidate_count)}"
+            else:
+                records = records[:max_rows]
+                selection_note = f"первые {format_int(max_rows)} из {format_int(candidate_count)}"
+
+        texts = [text for text, _, _ in records]
+        labels = [label for _, label, _ in records] if use_labels else []
+        sources = [source for _, _, source in records]
+
+        options = self._analysis_options()
+        self._set_status("Сравнение моделей", "running")
+        self.statusBar().showMessage("Выполняется сравнение моделей...")
+        QApplication.processEvents()
+
+        def comparison_progress(model_name: str, processed: int, total: int) -> None:
+            short_name = self._display_model_name(model_name)
+            self.statusBar().showMessage(
+                f"Сравнение моделей... {short_name}: {format_int(processed)} / {format_int(total)}"
+            )
+            QApplication.processEvents()
+
+        try:
+            result = compare_models(
+                selected_models,
+                texts,
+                options,
+                self._analysis_device(),
+                true_labels=labels or None,
+                sources=sources,
+                batch_size=None,
+                progress_callback=comparison_progress,
+            )
+        except TransformerLoadError as exc:
+            self._set_status("Ошибка", "error")
+            self.statusBar().showMessage("Ошибка сравнения моделей.")
+            QMessageBox.critical(self, "Ошибка сравнения моделей", str(exc))
+            return
+
+        self.comparison_behavior_rows = result.behavior_rows
+        self.comparison_quality_rows = result.quality_rows
+        self._populate_comparison_quality_table(result)
+        self._populate_comparison_behavior_table(result)
+        self._populate_comparison_disagreement_table(result)
+        self._populate_comparison_charts(result)
+        self.comparison_quality_summary.setText(self._build_comparison_quality_summary(result))
+        self.comparison_status_label.setText(
+            f"Сравнение завершено: {format_int(len(selected_models))} моделей, {format_int(len(texts))} текстов "
+            f"({selection_note}), расхождений найдено {format_int(len(result.disagreements))}."
+        )
+        self._set_status("Готово", "ready")
+        self.statusBar().showMessage("Сравнение моделей завершено.")
+        self._log(
+            f"Сравнение моделей завершено: {len(selected_models)} моделей, {len(texts)} текстов "
+            f"({selection_note}), {len(result.disagreements)} расхождений."
+        )
+
+    def _populate_comparison_quality_table(self, result: object) -> None:
+        rows = getattr(result, "quality_rows", [])
+        self.comparison_quality_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            values = [
+                self._display_model_name(item.model_name),
+                item.schema_signature,
+                format_int(item.sample_count),
+                f"{item.accuracy:.3f}",
+                f"{item.macro_f1:.3f}",
             ]
             for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if hasattr(self, "model_combo") and name == self.model_combo.currentText():
-                    item.setBackground(QColor("#d7e5fb"))
-                self.profile_table.setItem(row, column, item)
+                table_item = QTableWidgetItem(value)
+                if column == 0:
+                    table_item.setToolTip(item.model_name)
+                self.comparison_quality_table.setItem(row, column, table_item)
+
+    def _populate_comparison_behavior_table(self, result: object) -> None:
+        rows = getattr(result, "behavior_rows", [])
+        self.comparison_behavior_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            values = [
+                self._display_model_name(item.model_name),
+                self._schema_signature(item.schema.labels),
+                f"{item.avg_confidence:.3f}",
+                f"{item.median_confidence:.3f}",
+                f"{item.low_confidence_rate:.1%}",
+                f"{item.prediction_entropy:.3f}",
+                f"{item.top_class_share:.1%}",
+                f"{item.inference_seconds:.2f}",
+            ]
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                if column == 0:
+                    table_item.setToolTip(item.model_name)
+                self.comparison_behavior_table.setItem(row, column, table_item)
+
+    def _populate_comparison_disagreement_table(self, result: object) -> None:
+        rows = getattr(result, "disagreements", [])
+        self.comparison_disagreement_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            predictions = " | ".join(
+                f"{self._display_model_name(model)}: {label} ({item.confidences.get(model, 0.0):.2f})"
+                for model, label in item.predictions.items()
+            )
+            values = [
+                str(row + 1),
+                item.text[:260],
+                predictions,
+            ]
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                if column == 2:
+                    table_item.setToolTip(predictions)
+                self.comparison_disagreement_table.setItem(row, column, table_item)
+
+    def _populate_comparison_charts(self, result: object) -> None:
+        quality_rows = getattr(result, "quality_rows", [])
+        behavior_rows = getattr(result, "behavior_rows", [])
+
+        if quality_rows:
+            quality_labels = [self._display_model_name(item.model_name) for item in quality_rows]
+            self.comparison_quality_chart.draw_grouped_bars(
+                quality_labels,
+                [
+                    ("Accuracy", [item.accuracy for item in quality_rows], "#7aa5dc"),
+                    ("Macro F1", [item.macro_f1 for item in quality_rows], "#d97706"),
+                ],
+                y_max=1.0,
+                rotate_labels=20,
+            )
+        else:
+            self.comparison_quality_chart.empty("Нет метрик качества")
+
+        if behavior_rows:
+            behavior_labels = [self._display_model_name(item.model_name) for item in behavior_rows]
+            self.comparison_behavior_chart.draw_grouped_bars(
+                behavior_labels,
+                [
+                    ("Средняя уверенность", [item.avg_confidence for item in behavior_rows], "#7aa5dc"),
+                    ("Низкая уверенность", [item.low_confidence_rate for item in behavior_rows], "#ef4444"),
+                ],
+                y_max=1.0,
+                rotate_labels=20,
+            )
+            self.comparison_speed_chart.draw_grouped_bars(
+                behavior_labels,
+                [("Секунды", [item.inference_seconds for item in behavior_rows], "#16a34a")],
+                rotate_labels=20,
+            )
+            self._draw_comparison_disagreement_chart(behavior_rows)
+        else:
+            self.comparison_behavior_chart.empty("Нет данных поведения")
+            self.comparison_speed_chart.empty("Нет данных по времени")
+            self.comparison_disagreement_chart.empty("Нет данных о расхождениях")
+
+    def _draw_comparison_disagreement_chart(self, rows: list[object]) -> None:
+        if len(rows) < 2:
+            self.comparison_disagreement_chart.empty("Нужно минимум 2 модели")
+            return
+
+        labels = [self._display_model_name(getattr(row, "model_name", "")) for row in rows]
+        sizes = [len(getattr(row, "predictions", [])) for row in rows]
+        total = min(sizes) if sizes else 0
+        if total <= 0:
+            self.comparison_disagreement_chart.empty("Нет предсказаний")
+            return
+
+        matrix: list[list[float]] = []
+        for row_index, left_row in enumerate(rows):
+            left_predictions = getattr(left_row, "predictions", [])
+            row_values: list[float] = []
+            for column_index, right_row in enumerate(rows):
+                if row_index == column_index:
+                    row_values.append(0.0)
+                    continue
+                right_predictions = getattr(right_row, "predictions", [])
+                disagreements = 0
+                for index in range(total):
+                    if left_predictions[index].sentiment != right_predictions[index].sentiment:
+                        disagreements += 1
+                row_values.append(disagreements / total if total else 0.0)
+            matrix.append(row_values)
+        self.comparison_disagreement_chart.draw_heatmap(labels, matrix)
+
+    def _format_comparison_notes(self, notes: list[str]) -> str:
+        lines: list[str] = []
+        for note in notes:
+            compact = note
+            for model_name in self._selected_comparison_models():
+                compact = compact.replace(model_name, self._display_model_name(model_name))
+            if compact:
+                lines.append(compact)
+        return "\n".join(lines)
+
+    def _build_comparison_quality_summary(self, result: object) -> str:
+        quality_rows = getattr(result, "quality_rows", [])
+        quality_groups = getattr(result, "quality_groups", {})
+        notes = self._format_comparison_notes(getattr(result, "quality_notes", []))
+
+        lines: list[str] = []
+        if quality_rows:
+            lines.append(f"Метрики качества посчитаны для {format_int(len(quality_rows))} моделей.")
+        else:
+            lines.append("Метрики качества пока недоступны.")
+
+        compatible = [
+            f"{signature} - {format_int(len(models))} мод."
+            for signature, models in quality_groups.items()
+            if len(models) >= 2
+        ]
+        if compatible:
+            lines.append("Совместимые схемы: " + "; ".join(compatible) + ".")
+
+        if notes:
+            lines.append("Причины:")
+            lines.extend(f"• {line}" for line in notes.splitlines() if line.strip())
+        return "\n".join(lines)
 
     @staticmethod
     def _format_profile_metric(value: object) -> str:
-        if value in (None, "", "—"):
-            return "—"
+        if value in (None, "", "-"):
+            return "-"
         try:
             return f"{float(value):.2f}"
         except (TypeError, ValueError):
             return str(value)
+
+    @staticmethod
+    def _schema_signature(labels: tuple[str, ...] | list[str]) -> str:
+        if not labels:
+            return "неизвестно"
+        text = " | ".join(str(label) for label in labels)
+        return text if len(text) <= 120 else f"{text[:117]}..."
 
     @staticmethod
     def _model_identity(model_name: str) -> str:
@@ -3067,7 +4050,7 @@ class MainWindow(QMainWindow):
     def _is_trained_inference_model(folder: Path) -> bool:
         return (folder / "training_metrics.json").exists()
 
-    def _local_model_profile(self, model_path: str) -> dict[str, float | int | str]:
+    def _local_model_profile(self, model_path: str) -> dict[str, float | int | str | bool]:
         path = Path(model_path)
         metrics_path = path / "training_metrics.json"
         metrics: dict[str, object] = {}
@@ -3076,13 +4059,96 @@ class MainWindow(QMainWindow):
                 metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 metrics = {}
+        is_trained = bool(metrics)
+        display_name = path.name if is_trained else self._training_base_display_name(path)
+        schema = inspect_model_schema(model_path)
         return {
             "name": str(path.resolve()) if path.exists() else model_path,
+            "display_name": display_name,
             "status": "локальная обученная" if metrics else self._model_status(model_path),
-            "accuracy": metrics.get("accuracy", "—"),
-            "macro_f1": metrics.get("macro_f1", "—"),
-            "confidence": "—",
+            "label_schema": self._schema_signature(schema.labels),
+            "quality_group": schema.signature if schema.labels else "-",
+            "accuracy": metrics.get("accuracy", "-"),
+            "macro_f1": metrics.get("macro_f1", "-"),
+            "can_rename": is_trained,
+            "registry_key": str(path.resolve()).casefold() if is_trained else f"base::{display_name.casefold()}",
         }
+
+    @staticmethod
+    def _model_config_dict(model_path: Path) -> dict[str, object]:
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            return {}
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _training_base_display_name(self, model_path: Path) -> str:
+        config = self._model_config_dict(model_path)
+        raw_name = str(config.get("_name_or_path") or config.get("name_or_path") or "").strip()
+        if raw_name and raw_name not in {".", ".."} and not raw_name.startswith(str(model_path)):
+            return Path(raw_name).name if raw_name.endswith(tuple(WEIGHT_FILES)) else raw_name
+
+        for part in model_path.parts:
+            if part.startswith("models--"):
+                repo_name = part.removeprefix("models--").replace("--", "/").strip("/")
+                if repo_name:
+                    return repo_name
+        return model_path.name
+
+    def _find_profile_row(self, model_name: str) -> int | None:
+        if not hasattr(self, "profile_table"):
+            return None
+        target = self._model_identity(model_name)
+        for row in range(self.profile_table.rowCount()):
+            item = self.profile_table.item(row, 0)
+            if item is None:
+                continue
+            current = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            if self._model_identity(current) == target:
+                return row
+        return None
+
+    def _handle_profile_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._populating_profile_table or item.column() != 0:
+            return
+        source_name = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        pending_name = self._pending_profile_rename_path or ""
+        if not source_name or self._model_identity(source_name) != self._model_identity(pending_name):
+            return
+
+        path = Path(source_name)
+        new_name = item.text().strip()
+        old_name = self._pending_profile_rename_original_name or path.name
+        self._pending_profile_rename_path = None
+        self._pending_profile_rename_original_name = ""
+
+        if not new_name or new_name == old_name:
+            self.populate_profile_table()
+            return
+        if any(char in new_name for char in '<>:"/\\|?*'):
+            QMessageBox.warning(self, "Недопустимое имя", "Имя папки содержит недопустимые символы.")
+            self.populate_profile_table()
+            return
+
+        target_path = path.with_name(new_name)
+        if target_path.exists():
+            QMessageBox.warning(self, "Имя занято", "Папка с таким именем уже существует.")
+            self.populate_profile_table()
+            return
+
+        try:
+            path.rename(target_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось переименовать", str(exc))
+            self.populate_profile_table()
+            return
+
+        self._refresh_model_lists(str(target_path.resolve()))
+        self.statusBar().showMessage(f"Модель переименована: {target_path.name}")
+        self._log(f"Модель переименована: {path.name} -> {target_path.name}.")
 
     def apply_filter(self, text: str) -> None:
         if not text:
@@ -3098,7 +4164,8 @@ class MainWindow(QMainWindow):
 
     def _select_model_from_profile(self, row: int, column: int) -> None:
         if self.profile_table.item(row, 0) is not None:
-            model_name = self.profile_table.item(row, 0).text()
+            item = self.profile_table.item(row, 0)
+            model_name = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
             if not self._is_trained_inference_model(Path(model_name)):
                 self.statusBar().showMessage("Это базовая модель для обучения, не готовая модель анализа.")
                 return
@@ -3210,6 +4277,10 @@ class MainWindow(QMainWindow):
                 background: #f8fafc;
                 border-top: 1px solid rgba(129, 145, 166, 0.35);
                 color: #5b677a;
+            }
+            QLabel#statusMessageLabel {
+                color: #5b677a;
+                padding: 0 12px;
             }
             #contextBar {
                 background: #f8fafc;
@@ -3326,6 +4397,28 @@ class MainWindow(QMainWindow):
             #mutedLabel {
                 color: #6b7280;
             }
+            QFrame#comparisonToolbar {
+                background: #f8fafc;
+                border: 1px solid rgba(129, 145, 166, 0.28);
+                border-radius: 6px;
+            }
+            #comparisonFieldLabel {
+                color: #526070;
+                font-size: 11px;
+                font-weight: 400;
+                margin-bottom: 2px;
+            }
+            #comparisonHint {
+                color: #6b7280;
+                font-size: 11px;
+            }
+            #comparisonStatusBox {
+                background: #fbfcfe;
+                border: 1px solid rgba(129, 145, 166, 0.28);
+                border-radius: 6px;
+                color: #344054;
+                padding: 8px 10px;
+            }
             #mappingSummary {
                 background: #f8fafc;
                 border: 1px solid rgba(129, 145, 166, 0.32);
@@ -3415,6 +4508,24 @@ class MainWindow(QMainWindow):
                 border-color: rgba(220, 38, 38, 0.62);
             }
             QPushButton#dangerButton:disabled {
+                color: #9ca3af;
+                background: #f1f4f8;
+                border-color: rgba(107, 120, 140, 0.28);
+            }
+            QPushButton#tableActionButton {
+                padding: 0px 12px;
+            }
+            QPushButton#tableDangerActionButton {
+                padding: 0px 12px;
+                background: #fff1f1;
+                border-color: rgba(220, 38, 38, 0.42);
+                color: #991b1b;
+            }
+            QPushButton#tableDangerActionButton:hover {
+                background: #fee2e2;
+                border-color: rgba(220, 38, 38, 0.62);
+            }
+            QPushButton#tableDangerActionButton:disabled {
                 color: #9ca3af;
                 background: #f1f4f8;
                 border-color: rgba(107, 120, 140, 0.28);
@@ -3516,9 +4627,13 @@ class MainWindow(QMainWindow):
                 color: #526070;
                 border: 0;
                 border-bottom: 1px solid rgba(129, 145, 166, 0.32);
+                border-right: 1px solid rgba(129, 145, 166, 0.32);
                 padding: 6px;
                 font-weight: 400;
                 font-size: 11px;
+            }
+            QHeaderView::section:last {
+                border-right: 0;
             }
             QProgressBar {
                 min-height: 12px;

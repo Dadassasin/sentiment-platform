@@ -6,6 +6,9 @@ __pycache__/
 data/
 experiments/
 *.log
-models/
+/models/
+tmp-*.png
+sentiment_report_*.html
+reports/preview_report.html
 
 

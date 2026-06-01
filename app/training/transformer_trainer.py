@@ -32,6 +32,39 @@ ID_TO_RU_LABEL = {
     "positive": "Положительная",
 }
 
+POSITIVE_LABEL_ALIASES = {
+    "positive",
+    "positiv",
+    "pos",
+    "+1",
+    "1",
+    "положительная",
+    "положительный",
+    "позитив",
+    "позитивная",
+    "позитивный",
+}
+NEUTRAL_LABEL_ALIASES = {
+    "neutral",
+    "neut",
+    "neu",
+    "0",
+    "нейтральная",
+    "нейтральный",
+    "нейтрально",
+}
+NEGATIVE_LABEL_ALIASES = {
+    "negative",
+    "neg",
+    "-1",
+    "2",
+    "отрицательная",
+    "отрицательный",
+    "негатив",
+    "негативная",
+    "негативный",
+}
+
 
 @dataclass(slots=True)
 class TrainConfig:
@@ -136,8 +169,8 @@ def train_transformer_classifier(
 ) -> TrainResult:
     """Fine-tune a sequence-classification transformer and save it locally.
 
-    Если val_texts/val_labels переданы — они используются как validation вместо
-    отрезания процента от train. Если переданы test_texts/test_labels — после
+    Если val_texts/val_labels переданы - они используются как validation вместо
+    отрезания процента от train. Если переданы test_texts/test_labels - после
     обучения выполняется held-out оценка и метрики сохраняются вместе с моделью.
     """
 
@@ -293,6 +326,8 @@ def train_transformer_classifier(
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     best_accuracy = 0.0
     best_f1 = 0.0
+    peak_accuracy = 0.0
+    peak_f1 = 0.0
     best_metric = -1.0
     best_state: dict[str, torch.Tensor] | None = None
     stale_evals = 0
@@ -329,12 +364,14 @@ def train_transformer_classifier(
         if cancelled():
             raise TrainingError("Обучение прервано пользователем.")
         accuracy, macro_f1 = evaluate(model, val_loader, device)
-        best_accuracy = max(best_accuracy, accuracy)
-        best_f1 = max(best_f1, macro_f1)
+        peak_accuracy = max(peak_accuracy, accuracy)
+        peak_f1 = max(peak_f1, macro_f1)
         current_metric = macro_f1 if config.metric_for_best_model == "macro_f1" else accuracy
         if current_metric > best_metric + config.early_stopping_threshold:
             best_metric = current_metric
             stale_evals = 0
+            best_accuracy = accuracy
+            best_f1 = macro_f1
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         else:
             stale_evals += 1
@@ -373,6 +410,8 @@ def train_transformer_classifier(
         "base_model": config.model_name,
         "accuracy": best_accuracy,
         "macro_f1": best_f1,
+        "peak_accuracy": peak_accuracy,
+        "peak_macro_f1": peak_f1,
         "train_size": len(train_texts),
         "validation_size": len(val_texts),
         "validation_source": validation_source,
@@ -466,12 +505,13 @@ def canonicalize_label(value: str) -> str:
 
 
 def map_label(value: str) -> str | None:
-    label = value.casefold().replace("-", "_").replace(" ", "_")
-    if any(marker in label for marker in ("positive", "positiv", "pos", "полож", "позит")):
+    raw_label = value.casefold().strip()
+    compact_label = raw_label.replace("-", "_").replace(" ", "_")
+    if raw_label in POSITIVE_LABEL_ALIASES or compact_label in POSITIVE_LABEL_ALIASES:
         return "positive"
-    if any(marker in label for marker in ("neutral", "neut", "neu", "нейтр")):
+    if raw_label in NEUTRAL_LABEL_ALIASES or compact_label in NEUTRAL_LABEL_ALIASES:
         return "neutral"
-    if any(marker in label for marker in ("negative", "neg", "отриц", "негат")):
+    if raw_label in NEGATIVE_LABEL_ALIASES or compact_label in NEGATIVE_LABEL_ALIASES:
         return "negative"
     return None
 
@@ -562,15 +602,16 @@ def make_dataset(tokenizer: object, texts: list[str], labels: list[int], config:
     padding: bool | str = config.padding
     if padding == "false":
         padding = False
-    encodings = tokenizer(
-        texts,
-        padding=padding,
-        truncation=config.truncation,
-        max_length=config.max_length,
-        truncation_strategy=config.truncation_strategy,
-        pad_to_multiple_of=config.pad_to_multiple_of if padding else None,
-        return_tensors="pt",
-    )
+    tokenizer_kwargs = {
+        "padding": padding,
+        "truncation": config.truncation,
+        "max_length": config.max_length,
+        "pad_to_multiple_of": config.pad_to_multiple_of if padding else None,
+        "return_tensors": "pt",
+    }
+    # New tokenizers backends reject truncation_strategy for encode_plus/batch encode.
+    # For our single-sequence classification inputs truncation+max_length is sufficient.
+    encodings = tokenizer(texts, **tokenizer_kwargs)
     return TextClassificationDataset(encodings, labels)
 
 
@@ -702,7 +743,11 @@ def macro_f1(targets: list[int], predictions: list[int]) -> float:
 def resolve_device(device_name: str) -> torch.device:
     if device_name.startswith("CUDA") or device_name == "Auto":
         if torch.cuda.is_available():
-            return torch.device("cuda")
+            if device_name.startswith("CUDA"):
+                parts = device_name.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    return torch.device(f"cuda:{parts[1]}")
+            return torch.device("cuda:0")
     return torch.device("cpu")
 
 
