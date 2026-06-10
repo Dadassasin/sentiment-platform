@@ -17,53 +17,12 @@ try:
     import torch
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
-except ImportError:  # pragma: no cover - dependency guard
+except ImportError:
     torch = None
     DataLoader = None
     Dataset = object
     AutoModelForSequenceClassification = None
     AutoTokenizer = None
-
-
-CANONICAL_LABELS = ("negative", "neutral", "positive")
-ID_TO_RU_LABEL = {
-    "negative": "Отрицательная",
-    "neutral": "Нейтральная",
-    "positive": "Положительная",
-}
-
-POSITIVE_LABEL_ALIASES = {
-    "positive",
-    "positiv",
-    "pos",
-    "+1",
-    "1",
-    "положительная",
-    "положительный",
-    "позитив",
-    "позитивная",
-    "позитивный",
-}
-NEUTRAL_LABEL_ALIASES = {
-    "neutral",
-    "neut",
-    "neu",
-    "0",
-    "нейтральная",
-    "нейтральный",
-    "нейтрально",
-}
-NEGATIVE_LABEL_ALIASES = {
-    "negative",
-    "neg",
-    "-1",
-    "2",
-    "отрицательная",
-    "отрицательный",
-    "негатив",
-    "негативная",
-    "негативный",
-}
 
 
 @dataclass(slots=True)
@@ -167,13 +126,6 @@ def train_transformer_classifier(
     test_texts: list[str] | None = None,
     test_labels: list[object] | None = None,
 ) -> TrainResult:
-    """Fine-tune a sequence-classification transformer and save it locally.
-
-    Если val_texts/val_labels переданы - они используются как validation вместо
-    отрезания процента от train. Если переданы test_texts/test_labels - после
-    обучения выполняется held-out оценка и метрики сохраняются вместе с моделью.
-    """
-
     if torch is None or AutoTokenizer is None or AutoModelForSequenceClassification is None:
         raise TrainingError("Не установлены зависимости torch/transformers. Выполните: pip install -r requirements.txt")
 
@@ -420,7 +372,7 @@ def train_transformer_classifier(
         "test_macro_f1": test_f1,
         "test_source": test_source,
         "label_to_id": label_to_id,
-        "id_to_ru_label": {str(label_to_id[key]): ID_TO_RU_LABEL.get(key, key) for key in label_to_id},
+        "id_to_label": {str(index): label for index, label in id_to_label.items()},
         "experiment_config": serialize_config(config),
     }
     (config.output_dir / "training_metrics.json").write_text(
@@ -486,34 +438,12 @@ def normalize_labels(labels: list[object]) -> list[str]:
     if not raw_values:
         raise TrainingError("Колонка меток пуста.")
 
-    normalized: list[str] = []
-    for value in raw_values:
-        normalized.append(canonicalize_label(value))
-    return normalized
+    return raw_values
 
 
 def build_label_mapping(labels: list[str]) -> dict[str, int]:
-    unique_labels = set(labels)
-    present = [label for label in CANONICAL_LABELS if label in unique_labels]
-    present.extend(sorted(label for label in unique_labels if label not in set(CANONICAL_LABELS)))
-    return {label: index for index, label in enumerate(present)}
-
-
-def canonicalize_label(value: str) -> str:
-    mapped = map_label(value)
-    return mapped if mapped is not None else str(value).strip()
-
-
-def map_label(value: str) -> str | None:
-    raw_label = value.casefold().strip()
-    compact_label = raw_label.replace("-", "_").replace(" ", "_")
-    if raw_label in POSITIVE_LABEL_ALIASES or compact_label in POSITIVE_LABEL_ALIASES:
-        return "positive"
-    if raw_label in NEUTRAL_LABEL_ALIASES or compact_label in NEUTRAL_LABEL_ALIASES:
-        return "neutral"
-    if raw_label in NEGATIVE_LABEL_ALIASES or compact_label in NEGATIVE_LABEL_ALIASES:
-        return "negative"
-    return None
+    unique_labels = sorted(set(labels))
+    return {label: index for index, label in enumerate(unique_labels)}
 
 
 def prepare_rows(texts: list[str], labels: list[object], config: TrainConfig) -> list[tuple[str, object]]:

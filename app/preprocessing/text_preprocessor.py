@@ -1,117 +1,26 @@
-"""Russian text preprocessing pipeline."""
-
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from functools import lru_cache
 
+from nltk.corpus import stopwords as nltk_stopwords
+
 try:
     import pymorphy3
-except ImportError:  # pragma: no cover - optional dependency guard
+except ImportError:
     pymorphy3 = None
 
 
-RUSSIAN_STOP_WORDS = {
-    "а",
+NEGATION_WORDS = {
     "без",
-    "более",
-    "бы",
-    "был",
-    "была",
-    "были",
-    "было",
-    "быть",
-    "в",
-    "вам",
-    "вас",
-    "весь",
-    "во",
-    "вот",
-    "все",
-    "всего",
-    "вы",
-    "где",
-    "да",
-    "даже",
-    "для",
-    "до",
-    "его",
-    "ее",
-    "если",
-    "есть",
-    "еще",
-    "же",
-    "за",
-    "и",
-    "из",
-    "или",
-    "им",
-    "их",
-    "к",
-    "как",
-    "ко",
-    "когда",
-    "кто",
-    "ли",
-    "либо",
-    "мне",
-    "может",
-    "мы",
-    "на",
-    "над",
-    "надо",
-    "наш",
     "не",
-    "него",
-    "нее",
     "нет",
     "ни",
-    "них",
-    "но",
-    "ну",
-    "о",
-    "об",
-    "однако",
-    "он",
-    "она",
-    "они",
-    "оно",
-    "от",
-    "очень",
-    "по",
-    "под",
-    "при",
-    "про",
-    "с",
-    "со",
-    "так",
-    "также",
-    "такой",
-    "там",
-    "те",
-    "тем",
-    "то",
-    "того",
-    "тоже",
-    "той",
-    "только",
-    "том",
-    "ты",
-    "у",
-    "уже",
-    "хотя",
-    "чего",
-    "чей",
-    "чем",
-    "что",
-    "чтобы",
-    "чье",
-    "эта",
-    "эти",
-    "это",
-    "я",
+    "никогда",
 }
+
+RUSSIAN_STOP_WORDS = set(nltk_stopwords.words("russian")) - NEGATION_WORDS
 
 
 @dataclass(slots=True)
@@ -123,8 +32,6 @@ class PreprocessingOptions:
 
 
 class TextPreprocessor:
-    """Configurable preprocessing for Russian text."""
-
     def __init__(self, options: PreprocessingOptions | None = None) -> None:
         self.options = options or PreprocessingOptions()
         self._morph = pymorphy3.MorphAnalyzer() if pymorphy3 is not None else None

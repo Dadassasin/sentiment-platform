@@ -1,5 +1,3 @@
-"""Experiment metric utilities for model comparison."""
-
 from __future__ import annotations
 
 from collections import Counter
