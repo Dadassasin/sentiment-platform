@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.active_learning import UncertainExample, select_uncertain_examples
 from app.models.sentiment import (
     AnalysisResult,
     MODEL_PROFILES,
@@ -83,6 +84,8 @@ SENTIMENT_COLORS = {
     NEUTRAL: "#d97706",
     NEGATIVE: "#dc2626",
 }
+
+ACTIVE_LEARNING_THRESHOLD = 0.60
 
 # Dense desktop design tokens, all spacing values use a 4px grid.
 SPACE_1 = 4
@@ -431,9 +434,9 @@ class MetricCard(QFrame):
     def __init__(self, title: str, value: str = "0", subtitle: str = "") -> None:
         super().__init__()
         self.setObjectName("metricCard")
-        self.setMinimumHeight(72)
+        self.setMinimumHeight(58)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(SPACE_3, SPACE_2, SPACE_3, SPACE_2)
+        layout.setContentsMargins(SPACE_3, SPACE_1, SPACE_3, SPACE_1)
         layout.setSpacing(SPACE_1)
 
         self.title_label = QLabel(title)
@@ -1009,7 +1012,9 @@ class MainWindow(QMainWindow):
         settings_form.setContentsMargins(0, 0, 0, 0)
         settings_form.setSpacing(SPACE_2)
 
-        analysis_data_row = QHBoxLayout()
+        self.analysis_data_row_widget = QWidget()
+        analysis_data_row = QHBoxLayout(self.analysis_data_row_widget)
+        analysis_data_row.setContentsMargins(0, 0, 0, 0)
         analysis_data_row.setSpacing(SPACE_2)
         self.analysis_load_button = QPushButton("Загрузить файл анализа")
         self.analysis_load_button.setObjectName("primaryButton")
@@ -1019,12 +1024,14 @@ class MainWindow(QMainWindow):
         self.analysis_dataset_label = QLabel("Файл для пакетного анализа не загружен.")
         self.analysis_dataset_label.setObjectName("mutedLabel")
         self.analysis_dataset_label.setWordWrap(True)
-        analysis_data_row.addWidget(QLabel("Файл:"))
+        self.analysis_file_label = QLabel("Файл:")
+        analysis_data_row.addWidget(self.analysis_file_label)
         analysis_data_row.addWidget(self.analysis_load_button)
         analysis_data_row.addWidget(self.analysis_clear_button)
         analysis_data_row.addWidget(self.analysis_dataset_label, 1)
-        settings_form.addLayout(analysis_data_row)
-        settings_form.addWidget(self._soft_separator())
+        settings_form.addWidget(self.analysis_data_row_widget)
+        self.analysis_file_separator = self._soft_separator()
+        settings_form.addWidget(self.analysis_file_separator)
 
         self.text_column_combo = QComboBox()
         self.text_column_combo.addItem("text")
@@ -1062,8 +1069,8 @@ class MainWindow(QMainWindow):
         model_row.setSpacing(SPACE_2)
         model_row.addWidget(self.text_column_label)
         model_row.addWidget(self.text_column_combo)
-        model_row.addSpacing(SPACE_4)
-        model_row.addWidget(QLabel("Модель:"))
+        self.model_label = QLabel("Модель:")
+        model_row.addWidget(self.model_label)
         model_row.addWidget(self.model_combo, 1)
         model_row.addWidget(self.browse_model_button)
         settings_form.addLayout(model_row)
@@ -1085,6 +1092,7 @@ class MainWindow(QMainWindow):
         hint.setObjectName("mutedLabel")
         hint.setWordWrap(True)
         hint.setContentsMargins(0, 0, 0, 0)
+        hint.setMaximumHeight(24)
         settings.layout.addWidget(hint)
         page.layout().addWidget(settings)
 
@@ -1092,28 +1100,35 @@ class MainWindow(QMainWindow):
         batch_page = QWidget()
         batch_layout = QVBoxLayout(batch_page)
         batch_layout.setContentsMargins(0, 0, 0, 0)
-        batch_layout.setSpacing(SPACE_3)
+        batch_layout.setSpacing(SPACE_2)
 
-        metrics = QGridLayout()
-        metrics.setHorizontalSpacing(SPACE_3)
-        metrics.setVerticalSpacing(SPACE_3)
-        self.total_card = MetricCard("Всего текстов", "0", "в наборе данных")
-        self.processed_card = MetricCard("Проанализировано", "0", "строк")
-        self.confidence_card = MetricCard("Средняя уверенность", "0.00", "по результатам")
-        self.low_confidence_card = MetricCard("Низкая уверенность", "0", "ниже 0.60")
-        for column, card in enumerate([self.total_card, self.processed_card, self.confidence_card, self.low_confidence_card]):
-            metrics.addWidget(card, 0, column)
-            metrics.setColumnStretch(column, 1)
-        batch_layout.addLayout(metrics)
+        self.analysis_metrics_strip = QFrame()
+        self.analysis_metrics_strip.setObjectName("analysisMetricsStrip")
+        metrics = QHBoxLayout(self.analysis_metrics_strip)
+        metrics.setContentsMargins(SPACE_3, 0, SPACE_3, 0)
+        metrics.setSpacing(SPACE_4)
+        self.total_metric_label = self._analysis_metric_label("Всего", "0")
+        self.processed_metric_label = self._analysis_metric_label("Проанализировано", "0")
+        self.confidence_metric_label = self._analysis_metric_label("Средняя уверенность", "0.00")
+        self.low_confidence_metric_label = self._analysis_metric_label("На разметку", "0")
+        for label in (
+            self.total_metric_label,
+            self.processed_metric_label,
+            self.confidence_metric_label,
+            self.low_confidence_metric_label,
+        ):
+            metrics.addWidget(label)
+            metrics.addStretch(1)
+        batch_layout.addWidget(self.analysis_metrics_strip)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_results_panel())
         splitter.addWidget(self._build_analysis_right_panel())
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, True)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([820, 320])
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([980, 260])
         batch_layout.addWidget(splitter, 1)
 
         self.analysis_mode_stack.addWidget(batch_page)
@@ -1224,9 +1239,9 @@ class MainWindow(QMainWindow):
         right = QWidget()
         layout = QVBoxLayout(right)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(SPACE_3)
-        self.class_chart = ChartWidget("Сводка анализа: классы", 155)
-        self.confidence_chart = ChartWidget("Сводка анализа: уверенность", 155)
+        layout.setSpacing(SPACE_2)
+        self.class_chart = ChartWidget("Сводка анализа: классы", 190)
+        self.confidence_chart = ChartWidget("Сводка анализа: уверенность", 190)
         layout.addWidget(self.class_chart)
         layout.addWidget(self.confidence_chart)
         layout.addStretch(1)
@@ -2077,6 +2092,11 @@ class MainWindow(QMainWindow):
             label_widget.setToolTip(help_text)
         return label_widget
 
+    def _analysis_metric_label(self, title: str, value: str) -> QLabel:
+        label = QLabel(f"{title}: {value}")
+        label.setObjectName("analysisMetricText")
+        return label
+
     def _comparison_field_label(self, label: str) -> QLabel:
         label_widget = QLabel(label)
         label_widget.setObjectName("comparisonFieldLabel")
@@ -2291,9 +2311,8 @@ class MainWindow(QMainWindow):
         self.analyze_button.setVisible(is_batch)
         self.text_column_combo.setVisible(is_batch)
         self.text_column_label.setVisible(is_batch)
-        self.analysis_load_button.setVisible(is_batch)
-        self.analysis_clear_button.setVisible(is_batch)
-        self.analysis_dataset_label.setVisible(is_batch)
+        self.analysis_data_row_widget.setVisible(is_batch)
+        self.analysis_file_separator.setVisible(is_batch)
         if hasattr(self, "analysis_mode_hint"):
             if is_batch:
                 self.analysis_mode_hint.setText("Пакетный анализ использует отдельный файл анализа, не train-датасет.")
@@ -3330,11 +3349,15 @@ class MainWindow(QMainWindow):
         summary = summarize_results(self.results)
         total = len(self.analysis_data_frame)
         processed = int(summary["processed"])
-        low_confidence = sum(result.confidence < 0.60 for result in self.results)
-        self.total_card.set_values(format_int(total), "в наборе данных")
-        self.processed_card.set_values(format_int(processed), f"строк ({processed / max(total, 1):.1%})")
-        self.confidence_card.set_values(f"{float(summary['avg_confidence']):.2f}", "по результатам")
-        self.low_confidence_card.set_values(format_int(low_confidence), "ниже 0.60")
+        uncertain_examples = self._active_learning_candidates()
+        self.total_metric_label.setText(f"Всего: {format_int(total)}")
+        self.processed_metric_label.setText(
+            f"Проанализировано: {format_int(processed)} ({processed / max(total, 1):.1%})"
+        )
+        self.confidence_metric_label.setText(f"Средняя уверенность: {float(summary['avg_confidence']):.2f}")
+        self.low_confidence_metric_label.setText(
+            f"На разметку: {format_int(len(uncertain_examples))} (<{ACTIVE_LEARNING_THRESHOLD:.2f})"
+        )
         self.populate_results_table(self.results)
         self.class_chart.draw_class_distribution(class_distribution(self.results))
         self.confidence_chart.draw_confidence_histogram(self.results)
@@ -3353,13 +3376,23 @@ class MainWindow(QMainWindow):
         rows = [
             ("Проанализировано", format_int(total)),
             ("Средняя уверенность", f"{avg_confidence:.2f}"),
-            ("Низкая уверенность (<0.60)", format_int(sum(result.confidence < 0.60 for result in self.results))),
+            (
+                f"Кандидаты для разметки (<{ACTIVE_LEARNING_THRESHOLD:.2f})",
+                format_int(len(self._active_learning_candidates())),
+            ),
         ]
         rows.extend((f"Класс: {label}", format_int(count)) for label, count in counts.most_common(8))
         self.monitoring_table.setRowCount(len(rows))
         for row, (name, value) in enumerate(rows):
             self.monitoring_table.setItem(row, 0, QTableWidgetItem(name))
             self.monitoring_table.setItem(row, 1, QTableWidgetItem(value))
+
+    def _active_learning_candidates(self) -> list[UncertainExample]:
+        return select_uncertain_examples(
+            [result.text for result in self.results],
+            [result.probabilities for result in self.results],
+            threshold=ACTIVE_LEARNING_THRESHOLD,
+        )
 
     def populate_preview_table(self) -> None:
         source_frame = self._current_preview_frame()
@@ -4556,6 +4589,16 @@ class MainWindow(QMainWindow):
                 font-weight: 600;
             }
             QPushButton#primaryButton:hover { background: #1f65b8; }
+            QFrame#analysisMetricsStrip {
+                background: #fbfcfe;
+                border: 1px solid rgba(129, 145, 166, 0.28);
+                border-radius: 4px;
+                padding: 5px 8px;
+            }
+            QLabel#analysisMetricText {
+                color: #526070;
+                font-size: 11px;
+            }
             QPushButton#dangerButton {
                 background: #fff1f1;
                 border-color: rgba(220, 38, 38, 0.42);

@@ -1,6 +1,5 @@
-"""Reserved package.
+"""Simple active-learning helpers."""
 
-Active learning is intentionally excluded from the current implementation
-scope and can be added later without changing the application layout.
-"""
+from app.active_learning.selection import UncertainExample, select_uncertain_examples
 
+__all__ = ["UncertainExample", "select_uncertain_examples"]
