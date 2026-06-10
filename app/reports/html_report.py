@@ -7,15 +7,27 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
+from app.monitoring import MonitoringSnapshot, build_drift_report, build_monitoring_summary, compare_with_snapshot
 from app.models.sentiment import AnalysisResult
 
 
-def export_html_report(path: str | Path, results: list[AnalysisResult], model_name: str) -> Path:
+MONITORING_CONFIDENCE_THRESHOLD = 0.60
+
+
+def export_html_report(
+    path: str | Path,
+    results: list[AnalysisResult],
+    model_name: str,
+    previous_monitoring: MonitoringSnapshot | None = None,
+) -> Path:
     report_path = Path(path)
     counts = Counter(result.sentiment for result in results)
     avg_confidence = sum(result.confidence for result in results) / len(results) if results else 0
     low_confidence = [result for result in results if result.confidence < 0.60]
     score_labels = probability_labels(results)
+    monitoring = build_monitoring_summary(results, MONITORING_CONFIDENCE_THRESHOLD)
+    drift_report = build_drift_report(results)
+    monitoring_comparison = compare_with_snapshot(monitoring, previous_monitoring)
 
     top_cards = "".join(
         f"<div class=\"card\"><span>{escape(label)}</span><div class=\"value\">{format_int(count)}</div></div>"
@@ -53,6 +65,8 @@ def export_html_report(path: str | Path, results: list[AnalysisResult], model_na
     .hist {{ display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; align-items: end; height: 160px; }}
     .hist-col {{ background: #7aa5dc; min-height: 2px; border-radius: 4px 4px 0 0; }}
     .hist-labels {{ display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; color: #64748b; font-size: 11px; margin-top: 6px; }}
+    .monitoring {{ margin-top: 16px; }}
+    .status {{ display: inline-block; padding: 4px 8px; border-radius: 6px; background: #eef5ff; color: #1f5fa9; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #e5e7eb; padding: 9px; text-align: left; vertical-align: top; }}
     th {{ background: #f8fafc; color: #526070; }}
@@ -81,6 +95,11 @@ def export_html_report(path: str | Path, results: list[AnalysisResult], model_na
     </div>
   </div>
 
+  <div class="panel monitoring">
+    <h2>Мониторинг результата</h2>
+    {monitoring_table(monitoring, drift_report, monitoring_comparison)}
+  </div>
+
   <h2>Примеры с низкой уверенностью</h2>
   {low_confidence_table(low_rows)}
 
@@ -95,6 +114,75 @@ def export_html_report(path: str | Path, results: list[AnalysisResult], model_na
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(html, encoding="utf-8")
     return report_path
+
+
+def monitoring_table(monitoring: object, drift_report: object, comparison: object) -> str:
+    dominant_label, dominant_count, dominant_share = monitoring.dominant_class
+    confidence_trend = "недостаточно батчей"
+    points = getattr(drift_report, "points", [])
+    if len(points) >= 2:
+        confidence_trend = (
+            f"{points[0].avg_confidence:.2f} -> {points[-1].avg_confidence:.2f} "
+            f"({points[-1].avg_confidence - points[0].avg_confidence:+.2f})"
+        )
+
+    rows = [
+        ("Статус контроля", f"<span class=\"status\">{escape(monitoring.status)}</span>"),
+        ("Индекс необходимости проверки", escape(f"{monitoring.risk_index}/100 ({monitoring.risk_level})")),
+        ("Предупреждения", escape("; ".join(monitoring.warnings) if monitoring.warnings else "нет")),
+        ("Рекомендация", escape(monitoring.recommendation)),
+        ("Объем для мониторинга", escape(format_int(monitoring.total))),
+        ("Батчей на графике", escape(format_int(len(points)))),
+        ("Средняя уверенность", escape(f"{monitoring.avg_confidence:.2f}")),
+        ("Изменение уверенности", escape(confidence_trend)),
+        (
+            f"Доля сомнительных ответов (<{MONITORING_CONFIDENCE_THRESHOLD:.2f})",
+            escape(f"{format_int(monitoring.uncertain_count)} ({monitoring.uncertain_rate:.1%})"),
+        ),
+        ("Доминирующий класс", escape(f"{dominant_label} - {format_int(dominant_count)} ({dominant_share:.1%})")),
+        (
+            "Баланс тональности",
+            escape(
+                f"+ {monitoring.positive_share:.0%} / "
+                f"0 {monitoring.neutral_share:.0%} / "
+                f"- {monitoring.negative_share:.0%}"
+            ),
+        ),
+    ]
+
+    if comparison.available and comparison.previous is not None:
+        rows.extend(
+            [
+                (
+                    "Предыдущий запуск",
+                    escape(f"{comparison.previous.created_at} · {comparison.previous.model_name or 'модель не указана'}"),
+                ),
+                ("Изменение средней уверенности", escape(f"{comparison.confidence_delta:+.2f}")),
+                ("Изменение доли сомнительных", escape(f"{comparison.uncertain_rate_delta:+.1%}")),
+                ("Изменение индекса проверки", escape(f"{comparison.risk_index_delta:+d}")),
+                (
+                    "Изменение баланса",
+                    escape(
+                        f"+ {comparison.positive_share_delta:+.0%} / "
+                        f"0 {comparison.neutral_share_delta:+.0%} / "
+                        f"- {comparison.negative_share_delta:+.0%}"
+                    ),
+                ),
+            ]
+        )
+    else:
+        rows.append(("Предыдущий запуск", "нет сохраненного запуска для сравнения"))
+
+    rows.extend(
+        (
+            f"Другой класс: {label}",
+            escape(f"{format_int(count)} ({count / max(monitoring.total, 1):.1%})"),
+        )
+        for label, count in monitoring.other_counts.most_common(8)
+    )
+
+    body = "".join(f"<tr><td>{escape(name)}</td><td>{value}</td></tr>" for name, value in rows)
+    return f"<table><tbody>{body}</tbody></table>"
 
 
 def format_int(value: int) -> str:

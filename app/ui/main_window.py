@@ -58,7 +58,15 @@ from app.models.sentiment import (
     WEIGHT_FILES,
 )
 from app.models.comparison import compare_models
-from app.monitoring import build_drift_report
+from app.monitoring import (
+    MonitoringSnapshot,
+    build_drift_report,
+    build_monitoring_summary,
+    compare_with_snapshot,
+    create_monitoring_snapshot,
+    load_monitoring_snapshot,
+    save_monitoring_snapshot,
+)
 from app.preprocessing import PreprocessingOptions
 from app.reports import export_html_report
 from app.training.experiments import class_distribution, comparison_rows, summarize_results
@@ -86,6 +94,7 @@ SENTIMENT_COLORS = {
 }
 
 ACTIVE_LEARNING_THRESHOLD = 0.60
+MONITORING_SNAPSHOT_PATH = Path("reports") / "monitoring_last_run.json"
 
 # Dense desktop design tokens, all spacing values use a 4px grid.
 SPACE_1 = 4
@@ -693,6 +702,7 @@ class MainWindow(QMainWindow):
         self.preview_source = "train"
         self.current_report_path: Path | None = None
         self.results: list[AnalysisResult] = []
+        self.previous_monitoring_snapshot: MonitoringSnapshot | None = None
         self.comparison_behavior_rows: list[object] = []
         self.comparison_quality_rows: list[object] = []
         self.event_log: list[tuple[str, str]] = []
@@ -1889,14 +1899,14 @@ class MainWindow(QMainWindow):
         self._add_page_header(
             page,
             "Мониторинг результатов",
-            "После анализа здесь отображаются уверенность, распределения классов и признаки изменения данных.",
+            "Контроль стабильности результата: уверенность по батчам, перекос классов и доля сомнительных ответов.",
         )
         self.monitoring_stack = QStackedWidget()
 
         self.monitoring_stack.addWidget(
             self._empty_state_panel(
                 title="Мониторинг появится после анализа",
-                message="Запустите пакетный анализ, чтобы здесь появились динамика уверенности, распределение классов и сводка дрейфа.",
+                message="Запустите пакетный анализ, чтобы увидеть признаки нестабильности: падение уверенности, перекос классов и долю сомнительных ответов.",
                 action_label="Перейти к анализу",
                 action_callback=lambda: self._switch_page(1),
                 secondary_label="К данным",
@@ -2657,6 +2667,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Колонка не найдена", "Выберите колонку с текстом.")
             return
 
+        self.previous_monitoring_snapshot = load_monitoring_snapshot(MONITORING_SNAPSHOT_PATH)
         source_column = self._guess_source_column(self.analysis_data_frame)
         options = self._analysis_options()
         self._set_status("Загрузка модели", "running")
@@ -2684,6 +2695,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Анализ завершен.")
         self._log(f"Анализ завершен. Обработано {len(self.results)} строк.")
         self.refresh_analysis()
+        self._save_monitoring_snapshot()
         self._switch_page(1)
 
     def run_quick_text_analysis(self) -> None:
@@ -2759,7 +2771,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт отчёта", default_name, "HTML (*.html)")
         if not path:
             return
-        report_path = export_html_report(path, self.results, self.model_combo.currentText())
+        report_path = export_html_report(
+            path,
+            self.results,
+            self.model_combo.currentText(),
+            self.previous_monitoring_snapshot,
+        )
         self.current_report_path = report_path
         self._load_report_preview(report_path)
         self._log(f"HTML-отчёт сохранен: {report_path}.")
@@ -2776,6 +2793,7 @@ class MainWindow(QMainWindow):
             reports_dir / "preview_report.html",
             self.results,
             self.model_combo.currentText(),
+            self.previous_monitoring_snapshot,
         )
         self.current_report_path = report_path
         self._load_report_preview(report_path)
@@ -3368,24 +3386,76 @@ class MainWindow(QMainWindow):
 
     def refresh_monitoring(self) -> None:
         report = build_drift_report(self.results)
+        monitoring = build_monitoring_summary(self.results, ACTIVE_LEARNING_THRESHOLD)
+        comparison = compare_with_snapshot(monitoring, self.previous_monitoring_snapshot)
         self.drift_chart.draw_drift(self.results)
-        self.monitoring_summary_label.setText(report.message)
-        counts = class_distribution(self.results)
-        total = len(self.results)
-        avg_confidence = sum(result.confidence for result in self.results) / total if total else 0
+        message = monitoring.message
+        if report.warning:
+            message = f"{message} {report.message}"
+        self.monitoring_summary_label.setText(message)
+        dominant_label, dominant_count, dominant_share = monitoring.dominant_class
+        confidence_delta = 0.0
+        confidence_trend = "недостаточно батчей"
+        if len(report.points) >= 2:
+            confidence_delta = report.points[-1].avg_confidence - report.points[0].avg_confidence
+            confidence_trend = (
+                f"{report.points[0].avg_confidence:.2f} -> {report.points[-1].avg_confidence:.2f} "
+                f"({confidence_delta:+.2f})"
+            )
         rows = [
-            ("Проанализировано", format_int(total)),
-            ("Средняя уверенность", f"{avg_confidence:.2f}"),
+            ("Статус контроля", monitoring.status),
+            ("Индекс необходимости проверки", f"{monitoring.risk_index}/100 ({monitoring.risk_level})"),
+            ("Предупреждения", "; ".join(monitoring.warnings) if monitoring.warnings else "нет"),
+            ("Рекомендация", monitoring.recommendation),
+            ("Объем для мониторинга", format_int(monitoring.total)),
+            ("Батчей на графике", format_int(len(report.points))),
+            ("Средняя уверенность", f"{monitoring.avg_confidence:.2f}"),
+            ("Изменение уверенности", confidence_trend),
             (
-                f"Кандидаты для разметки (<{ACTIVE_LEARNING_THRESHOLD:.2f})",
-                format_int(len(self._active_learning_candidates())),
+                f"Доля сомнительных ответов (<{ACTIVE_LEARNING_THRESHOLD:.2f})",
+                f"{format_int(monitoring.uncertain_count)} ({monitoring.uncertain_rate:.1%})",
+            ),
+            (
+                "Доминирующий класс",
+                f"{dominant_label} - {format_int(dominant_count)} ({dominant_share:.1%})",
+            ),
+            (
+                "Баланс тональности",
+                f"+ {monitoring.positive_share:.0%} / 0 {monitoring.neutral_share:.0%} / - {monitoring.negative_share:.0%}",
             ),
         ]
-        rows.extend((f"Класс: {label}", format_int(count)) for label, count in counts.most_common(8))
+        if comparison.available and comparison.previous is not None:
+            rows.extend(
+                [
+                    (
+                        "Предыдущий запуск",
+                        f"{comparison.previous.created_at} · {comparison.previous.model_name or 'модель не указана'}",
+                    ),
+                    ("Изменение средней уверенности", f"{comparison.confidence_delta:+.2f}"),
+                    ("Изменение доли сомнительных", f"{comparison.uncertain_rate_delta:+.1%}"),
+                    ("Изменение индекса проверки", f"{comparison.risk_index_delta:+d}"),
+                    (
+                        "Изменение баланса",
+                        (
+                            f"+ {comparison.positive_share_delta:+.0%} / "
+                            f"0 {comparison.neutral_share_delta:+.0%} / "
+                            f"- {comparison.negative_share_delta:+.0%}"
+                        ),
+                    ),
+                ]
+            )
+        else:
+            rows.append(("Предыдущий запуск", "нет сохраненного запуска для сравнения"))
+        rows.extend((f"Другой класс: {label}", f"{format_int(count)} ({count / max(monitoring.total, 1):.1%})") for label, count in monitoring.other_counts.most_common(8))
         self.monitoring_table.setRowCount(len(rows))
         for row, (name, value) in enumerate(rows):
             self.monitoring_table.setItem(row, 0, QTableWidgetItem(name))
             self.monitoring_table.setItem(row, 1, QTableWidgetItem(value))
+
+    def _save_monitoring_snapshot(self) -> None:
+        monitoring = build_monitoring_summary(self.results, ACTIVE_LEARNING_THRESHOLD)
+        snapshot = create_monitoring_snapshot(monitoring, self.model_combo.currentText())
+        save_monitoring_snapshot(MONITORING_SNAPSHOT_PATH, snapshot)
 
     def _active_learning_candidates(self) -> list[UncertainExample]:
         return select_uncertain_examples(

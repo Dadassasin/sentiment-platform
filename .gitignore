@@ -28,6 +28,7 @@ dist/
 tmp-*.png
 sentiment_report_*.html
 reports/preview_report.html
+reports/monitoring_last_run.json
 .DS_Store
 Thumbs.db
 
