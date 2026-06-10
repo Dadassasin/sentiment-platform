@@ -1,14 +1,34 @@
 .venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 .idea/
 .vscode/
 data/
 experiments/
 *.log
 /models/
+*.egg-info/
+build/
+dist/
 tmp-*.png
 sentiment_report_*.html
 reports/preview_report.html
+.DS_Store
+Thumbs.db
 
 

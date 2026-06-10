@@ -419,8 +419,8 @@ class Panel(QFrame):
         super().__init__()
         self.setObjectName("panel")
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(SPACE_3, SPACE_2, SPACE_3, SPACE_3)
-        self.layout.setSpacing(SPACE_2)
+        self.layout.setContentsMargins(SPACE_3, SPACE_3, SPACE_3, SPACE_3)
+        self.layout.setSpacing(SPACE_3)
         if title:
             label = QLabel(title)
             label.setObjectName("panelTitle")
@@ -835,8 +835,13 @@ class MainWindow(QMainWindow):
 
     def _build_data_page(self) -> QWidget:
         page = self._page()
+        self._add_page_header(
+            page,
+            "Данные",
+            "Загрузите train, при необходимости отдельные validation и test, затем проверьте структуру таблицы.",
+        )
 
-        summary = Panel("Наборы данных")
+        summary = Panel("Загрузка и подготовка данных")
         slots_grid = QGridLayout()
         slots_grid.setHorizontalSpacing(SPACE_2)
         slots_grid.setVerticalSpacing(SPACE_2)
@@ -850,7 +855,7 @@ class MainWindow(QMainWindow):
         self.train_status_label = QLabel("Файл не открыт. Train обязателен для анализа и обучения.")
         self.train_status_label.setObjectName("mutedLabel")
         self.train_status_label.setWordWrap(True)
-        train_title = QLabel("Train")
+        train_title = QLabel("Train dataset")
         train_title.setObjectName("formLabel")
         slots_grid.addWidget(train_title, 0, 0)
         slots_grid.addWidget(self.train_load_button, 0, 1)
@@ -864,7 +869,7 @@ class MainWindow(QMainWindow):
         self.val_status_label = QLabel("Не загружен. Validation будет отделена из train по проценту в настройках обучения.")
         self.val_status_label.setObjectName("mutedLabel")
         self.val_status_label.setWordWrap(True)
-        val_title = QLabel("Validation")
+        val_title = QLabel("Validation dataset")
         val_title.setObjectName("formLabel")
         slots_grid.addWidget(val_title, 1, 0)
         slots_grid.addWidget(self.val_load_button, 1, 1)
@@ -878,7 +883,7 @@ class MainWindow(QMainWindow):
         self.test_status_label = QLabel("Не загружен. Test будет отделён из train по проценту в настройках обучения.")
         self.test_status_label.setObjectName("mutedLabel")
         self.test_status_label.setWordWrap(True)
-        test_title = QLabel("Test")
+        test_title = QLabel("Test dataset")
         test_title.setObjectName("formLabel")
         slots_grid.addWidget(test_title, 2, 0)
         slots_grid.addWidget(self.test_load_button, 2, 1)
@@ -911,7 +916,7 @@ class MainWindow(QMainWindow):
             data_metrics.setColumnStretch(column, 1)
         page.layout().addLayout(data_metrics)
 
-        preview = Panel("Предпросмотр")
+        preview = Panel("Предпросмотр данных")
         source_row = QHBoxLayout()
         source_row.setSpacing(SPACE_2)
         source_row.addWidget(QLabel("Выборка:"))
@@ -972,6 +977,11 @@ class MainWindow(QMainWindow):
 
     def _build_analysis_page(self) -> QWidget:
         page = self._page()
+        self._add_page_header(
+            page,
+            "Анализ текста",
+            "Выберите файл, модель и параметры предобработки, затем запустите классификацию.",
+        )
 
         mode_row = QHBoxLayout()
         mode_row.setSpacing(SPACE_1)
@@ -994,7 +1004,7 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.analysis_mode_hint)
         page.layout().addLayout(mode_row)
 
-        settings = Panel("Параметры анализа")
+        settings = Panel("Настройка и запуск анализа")
         settings_form = QVBoxLayout()
         settings_form.setContentsMargins(0, 0, 0, 0)
         settings_form.setSpacing(SPACE_2)
@@ -1038,6 +1048,7 @@ class MainWindow(QMainWindow):
 
         self.analyze_button = QPushButton("Запустить анализ")
         self.analyze_button.setObjectName("primaryButton")
+        self.analyze_button.setMinimumWidth(168)
         self.analyze_button.clicked.connect(self.run_analysis)
 
         self.browse_model_button = QPushButton("Выбрать папку…")
@@ -1186,7 +1197,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_results_panel(self) -> QWidget:
-        panel = Panel("Результаты анализа")
+        panel = Panel("Таблица результатов")
         header = QHBoxLayout()
         self.result_count_label = QLabel("Всего: 0")
         self.filter_edit = QLineEdit()
@@ -1214,8 +1225,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(right)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(SPACE_3)
-        self.class_chart = ChartWidget("Распределение классов", 155)
-        self.confidence_chart = ChartWidget("Распределение уверенности", 155)
+        self.class_chart = ChartWidget("Сводка анализа: классы", 155)
+        self.confidence_chart = ChartWidget("Сводка анализа: уверенность", 155)
         layout.addWidget(self.class_chart)
         layout.addWidget(self.confidence_chart)
         layout.addStretch(1)
@@ -1229,9 +1240,14 @@ class MainWindow(QMainWindow):
 
     def _build_training_page(self) -> QWidget:
         page = self._page()
+        self._add_page_header(
+            page,
+            "Обучение модели",
+            "Настройте эксперимент, метки и параметры дообучения; ход запуска отображается справа.",
+        )
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        settings = Panel("Обучение")
+        settings = Panel("Параметры обучения")
         settings.setObjectName("workbenchPanel")
         tabs = TrainingTabWidget()
         tabs.setObjectName("trainingTabs")
@@ -1491,6 +1507,7 @@ class MainWindow(QMainWindow):
         settings.layout.addWidget(tabs, 1)
         self.train_button = QPushButton("Запустить обучение")
         self.train_button.setObjectName("primaryButton")
+        self.train_button.setMinimumWidth(168)
         self.train_button.clicked.connect(self.start_training)
         self.cancel_train_button = QPushButton("Прервать")
         self.cancel_train_button.setObjectName("dangerButton")
@@ -1505,7 +1522,7 @@ class MainWindow(QMainWindow):
         settings.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         splitter.addWidget(settings)
 
-        progress_panel = Panel("Ход обучения")
+        progress_panel = Panel("Ход выполнения")
         progress_panel.setObjectName("workbenchPanel")
         progress_panel.setMinimumWidth(260)
         progress_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1617,7 +1634,12 @@ class MainWindow(QMainWindow):
 
     def _build_models_page(self) -> QWidget:
         page = self._page()
-        panel = Panel("Реестр моделей")
+        self._add_page_header(
+            page,
+            "Модели",
+            "Просматривайте локальные обученные модели, их метки и сохранённые метрики качества.",
+        )
+        panel = Panel("Реестр локальных моделей")
         note = QLabel(
             "Реестр показывает локальные обученные модели, их схему меток и пригодность для сравнения качества. "
             "Базовые контрольные точки нужны только для дообучения и не добавляются в список анализа."
@@ -1646,10 +1668,15 @@ class MainWindow(QMainWindow):
 
     def _build_comparison_page(self) -> QWidget:
         page = self._page()
+        self._add_page_header(
+            page,
+            "Сравнение моделей",
+            "Сопоставьте несколько моделей на одном наборе текстов и проверьте расхождения в ответах.",
+        )
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        controls = Panel("Сравнение моделей")
+        controls = Panel("Параметры сравнения")
         intro = QLabel(
             "Качество считается только для моделей с совпадающей схемой меток и при выбранной колонке истинной метки. "
             "Поведение можно сравнивать между любыми моделями."
@@ -1844,6 +1871,11 @@ class MainWindow(QMainWindow):
 
     def _build_monitoring_page(self) -> QWidget:
         page = self._page()
+        self._add_page_header(
+            page,
+            "Мониторинг результатов",
+            "После анализа здесь отображаются уверенность, распределения классов и признаки изменения данных.",
+        )
         self.monitoring_stack = QStackedWidget()
 
         self.monitoring_stack.addWidget(
@@ -1864,7 +1896,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.drift_chart = ChartWidget("Динамика уверенности и распределений", 320)
         splitter.addWidget(self.drift_chart)
-        panel = Panel("Сводка мониторинга")
+        panel = Panel("Показатели мониторинга")
         self.monitoring_summary_label = QLabel("Недостаточно данных для мониторинга.")
         self.monitoring_summary_label.setWordWrap(True)
         self.monitoring_summary_label.setObjectName("mutedLabel")
@@ -1890,6 +1922,11 @@ class MainWindow(QMainWindow):
 
     def _build_reports_page(self) -> QWidget:
         page = self._page()
+        self._add_page_header(
+            page,
+            "Отчёты",
+            "Сформируйте HTML-отчёт для демонстрации результатов анализа и качества модели.",
+        )
         self.reports_stack = QStackedWidget()
 
         self.reports_stack.addWidget(
@@ -1907,7 +1944,7 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(SPACE_3)
-        panel = Panel("HTML-отчёт")
+        panel = Panel("Экспорт и предпросмотр HTML-отчёта")
         toolbar = QHBoxLayout()
         toolbar.setSpacing(SPACE_2)
         export_button = QPushButton("Сохранить HTML")
@@ -2093,6 +2130,23 @@ class MainWindow(QMainWindow):
         separator.setFrameShape(QFrame.Shape.NoFrame)
         separator.setFixedHeight(1)
         return separator
+
+    def _add_page_header(self, page: QWidget, title: str, subtitle: str) -> None:
+        header = QFrame()
+        header.setObjectName("pageHeader")
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(SPACE_3, SPACE_2, SPACE_3, SPACE_2)
+        layout.setSpacing(SPACE_1)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("pageTitle")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("pageSubtitle")
+        subtitle_label.setWordWrap(True)
+
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        page.layout().addWidget(header)
 
     def _page(self) -> QWidget:
         page = QWidget()
@@ -2370,6 +2424,7 @@ class MainWindow(QMainWindow):
         self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.refresh_label_mapping_table()
+        self._set_status("Данные загружены", "ready")
         self.statusBar().showMessage(
             f"Validation загружен: {self.val_dataset_path.name} ({format_int(len(self.val_data_frame))} строк)."
         )
@@ -2408,6 +2463,7 @@ class MainWindow(QMainWindow):
         self._refresh_comparison_inputs()
         self._refresh_dataset_summary()
         self.refresh_label_mapping_table()
+        self._set_status("Данные загружены", "ready")
         self.statusBar().showMessage(
             f"Test загружен: {self.test_dataset_path.name} ({format_int(len(self.test_data_frame))} строк)."
         )
@@ -2605,7 +2661,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка модели", str(exc))
             return
 
-        self._set_status("Готово", "ready")
+        self._set_status("Анализ выполнен", "ready")
         self.statusBar().showMessage("Анализ завершен.")
         self._log(f"Анализ завершен. Обработано {len(self.results)} строк.")
         self.refresh_analysis()
@@ -2636,7 +2692,7 @@ class MainWindow(QMainWindow):
         self.quick_probability_label.setText("Распределение вероятностей")
         self.quick_confidence_bar.setValue(round(result.confidence * 100))
         self._populate_quick_probability_table(result.probabilities)
-        self._set_status("Готово", "ready")
+        self._set_status("Анализ выполнен", "ready")
         self.statusBar().showMessage("Быстрый анализ текста завершен.")
         self._log(f"Быстрый анализ: {result.sentiment}, уверенность {result.confidence:.2f}.")
 
@@ -2951,7 +3007,7 @@ class MainWindow(QMainWindow):
         self.training_progress.setValue(1)
         self.train_button.setEnabled(True)
         self.cancel_train_button.setEnabled(False)
-        self._set_status("Готово", "ready")
+        self._set_status("Обучение завершено", "ready")
         val_source = "файл" if result.validation_source == "external" else "split"
         self.training_metrics_chart.draw_training_result(result)
         self._append_training_log("Итог", "section")
@@ -3821,7 +3877,7 @@ class MainWindow(QMainWindow):
             f"Сравнение завершено: {format_int(len(selected_models))} моделей, {format_int(len(texts))} текстов "
             f"({selection_note}), расхождений найдено {format_int(len(result.disagreements))}."
         )
-        self._set_status("Готово", "ready")
+        self._set_status("Сравнение выполнено", "ready")
         self.statusBar().showMessage("Сравнение моделей завершено.")
         self._log(
             f"Сравнение моделей завершено: {len(selected_models)} моделей, {len(texts)} текстов "
@@ -4357,6 +4413,20 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
                 font-weight: 400;
             }
+            #pageHeader {
+                background: #f8fafc;
+                border: 1px solid rgba(129, 145, 166, 0.32);
+                border-radius: 6px;
+            }
+            #pageTitle {
+                color: #111827;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            #pageSubtitle {
+                color: #5b677a;
+                font-size: 12px;
+            }
             #panel, #metricCard {
                 background: #ffffff;
                 border: 1px solid rgba(129, 145, 166, 0.38);
@@ -4369,7 +4439,7 @@ class MainWindow(QMainWindow):
             }
             #panelTitle {
                 font-size: 13px;
-                font-weight: 400;
+                font-weight: 600;
                 color: #111827;
             }
             #metricTitle {
@@ -4483,7 +4553,7 @@ class MainWindow(QMainWindow):
                 background: #256fc7;
                 border-color: #1f5fa9;
                 color: white;
-                font-weight: 400;
+                font-weight: 600;
             }
             QPushButton#primaryButton:hover { background: #1f65b8; }
             QPushButton#dangerButton {
